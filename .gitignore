@@ -15,6 +15,9 @@ timelapse/
 # Machine-specific deploy target (Pi address, key path)
 .github/skills/deploy-pi/deploy.env
 
+# Local dev environment (built per machine, not part of the repo)
+.devcontainer/
+
 # Editors / OS
 .vscode/
 .DS_Store

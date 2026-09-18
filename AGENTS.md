@@ -18,7 +18,7 @@ The app runs on the Pi itself: Flask on `0.0.0.0:8080`.
 - `camera.py` — picamera2 backend: one camera process serves live preview (MJPEG), stills (JPEG + optional DNG) and video (H.264).
 - `app.py` — old basic version (no lamp, no extended settings). Do not touch unless explicitly needed.
 - `README.md` — what the project is (a Raspberry Pi timelapse camera first) and how to install it.
-- `.devcontainer/` — dev environment: Python 3.12, Flask, `gpiozero`, plus `openssh-client` + `rsync` for deployment. SSH keys are forwarded from the host into the container.
+- `.devcontainer/` — local dev environment (Python 3.12, Flask, `gpiozero`, plus `openssh-client` + `rsync` for deployment). Machine-specific and **gitignored**: it is not part of the published repository.
 
 ## Technologies
 

@@ -174,13 +174,13 @@ Everything the app produces lives in `~/camweb/`. None of it is in the repositor
 
 ## Development
 
-The repository ships a dev container (`.devcontainer/`) with Python 3.12, Flask and
-`gpiozero`, plus `openssh-client` and `rsync`, and forwards your host SSH keys so it
-can deploy.
-
 The app imports cleanly off the Pi: `picamera2` and `vcgencmd` are absent, so
 `camera.AVAILABLE` is `False` and the lamp is disabled. That is enough for UI work —
 but taking a photo needs the real hardware.
+
+The project is developed in a VS Code dev container (Python 3.12 with Flask and
+`gpiozero`, plus `openssh-client` and `rsync` for deployment). That container is
+built per machine and is deliberately **not** part of this repository.
 
 ### Deploy
 
@@ -219,3 +219,6 @@ bash .github/skills/deploy-pi/scripts/deploy.sh
 | `app.py` | the original basic version, kept for reference |
 | `AGENTS.md` | project notes and conventions |
 | `.github/skills/deploy-pi/` | deployment skill and script |
+
+Only `app_v2.py` is deployed; `app.py` is the earlier version and is kept for
+reference.
