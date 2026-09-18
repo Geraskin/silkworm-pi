@@ -90,6 +90,39 @@ SSH_TARGET=pi@192.168.1.50 bash .github/skills/deploy-pi/scripts/deploy.sh
 
 The script verifies SSH, uploads files, restarts the server (systemd if available, otherwise fallback) and checks the response.
 
+## Verify on the Pi
+
+`smoke-test.sh` reads the same `deploy.env` and checks everything that does not need
+eyes: the web server, a short timelapse, the frames and `state.json` on the card, the
+NAS cache and rotation, and the focus stream.
+
+```bash
+bash .github/skills/deploy-pi/scripts/smoke-test.sh              # deploy first:
+bash .github/skills/deploy-pi/scripts/smoke-test.sh --deploy     # run deploy.sh too
+bash .github/skills/deploy-pi/scripts/smoke-test.sh --reboot     # also test the resume
+```
+
+| Option | Effect |
+|--------|--------|
+| `--deploy` | run `deploy.sh` first |
+| `--reboot` | also verify that an interrupted run resumes across a real reboot |
+| `--interval N` | timelapse interval used for the test (default 5 s) |
+| `--frames N` | how many frames to wait for (default 4) |
+| `--keep-running` | leave the test timelapse running |
+
+It starts a short timelapse, waits for frames, checks that the files on the card
+match the counter and that their numbering is contiguous, then exercises the NAS:
+when the share is mounted it checks that the frames arrive and that the local copies
+are **kept** (the card is a cache), and when it is not it checks that **nothing is
+deleted**. With `--reboot` it takes the Pi down, waits for it to come back and
+verifies that the same session resumed, that frames continued, and that the missed
+shots were **not** replayed in a burst.
+
+It stops the test timelapse afterwards and restarts the service, because the focus
+stream leaves the ISP neutral. Exit code is 0 only when every check passed.
+
+Sharpness, colour and rotation still have to be judged by eye.
+
 ## Diagnostics
 
 - systemd logs: `ssh -i "${SSH_KEY}" "${SSH_TARGET}" 'sudo journalctl -u camweb -n 50 --no-pager'`
