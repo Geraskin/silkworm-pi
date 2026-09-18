@@ -70,17 +70,30 @@ card (it is stored in `settings.json` on the Pi):
 mounted on first use.
 
 Frames are **always written to the card first** and copied to the NAS afterwards, so
-a NAS that is asleep, slow or unplugged cannot lose a frame. The local folder is a
-queue that is drained as soon as the share is back:
+a NAS that is asleep, slow or unplugged cannot lose a frame:
 
 - each file is copied to `<name>.part` on the NAS and renamed only after the size
   checks out, so half-written files never appear there;
 - `state.json` never leaves the Pi, so resume-after-reboot keeps working even if
   the NAS is gone entirely;
-- the queue is retried in the background every 30 s, and *Sync now* pushes it
-  immediately;
-- *Delete the local copy after upload* stops the card from filling up — turn it off
-  if you want a local archive as well.
+- the sweep runs in the background a few seconds apart, and *Sync now* does it
+  immediately.
+
+### The card is a cache, not a queue
+
+Local copies are **kept**: the card is a fast cache in front of the NAS, so you can
+still review a run, re-copy it or assemble a video without touching the network.
+
+When free space drops below *Clear the card below, % free* (10 % by default), the
+oldest frames that are **already confirmed on the NAS** are removed first, and only
+until there is room again. A local frame is never removed unless its NAS copy exists
+with the same size, so the rotation cannot delete the only copy of anything. Frames
+still waiting for the NAS are left alone — which is what makes an unreachable NAS
+safe: nothing is deleted, and the timelapse's own low-disk guard stops the run
+instead of quietly eating the archive.
+
+Set the threshold to `0` to keep everything on the card and never clear
+automatically.
 
 ## Focus helper
 
@@ -198,7 +211,7 @@ Everything the app produces lives in `~/camweb/`. None of it is in the repositor
 | `latest.jpg` | the last still |
 | `latest.dng` | the last RAW capture |
 | `camweb.h264` | the last video recording |
-| `timelapse/` | timelapse sessions and `state.json` — frames waiting to be copied to a NAS are queued here |
+| `timelapse/` | timelapse sessions, `state.json`, and the cache of frames already on the NAS |
 | `settings.json` | saved camera, lamp and NAS settings |
 
 ## Development
