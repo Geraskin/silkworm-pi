@@ -42,6 +42,9 @@ DEFAULT_SETTINGS = {
     "shutter": 10000,
     "gain": 1.0,
     "save_raw": False,
+    "nas_enabled": False,
+    "nas_dir": "",
+    "nas_delete_local": True,
     "light_on": False,
     "light_brightness": 0.5,
     "light_freq": 1000,
@@ -543,6 +546,7 @@ function initFocusToggle() {
 function initTimelapse() {
     const start = document.getElementById("tl_start");
     const stop = document.getElementById("tl_stop");
+    const sync = document.getElementById("nas_sync");
     const info = document.getElementById("tl_status");
     const interval = document.getElementById("tl_interval");
 
@@ -550,13 +554,19 @@ function initTimelapse() {
         try {
             const s = await (await fetch("/timelapse/state")).json();
             if (!info) return;
+            let text;
             if (s.active) {
-                info.textContent = "running · " + s.session + " · frames " + s.frames + " · next in " + s.countdown_s + "s";
+                text = "running · " + s.session + " · frames " + s.frames + " · next in " + s.countdown_s + "s";
             } else if (s.frames) {
-                info.textContent = "stopped · " + s.session + " · frames " + s.frames + (s.last_error ? " · " + s.last_error : "");
+                text = "stopped · " + s.session + " · frames " + s.frames + (s.last_error ? " · " + s.last_error : "");
             } else {
-                info.textContent = "idle";
+                text = "idle";
             }
+            if (s.nas_enabled) {
+                text += " · NAS " + (s.nas_ready ? "ready" : (s.nas_reason || "unavailable"));
+                if (s.nas_pending) { text += ", queued " + s.nas_pending; }
+            }
+            info.textContent = text;
         } catch (e) {}
     }
     if (start) start.addEventListener("click", async () => {
@@ -567,6 +577,19 @@ function initTimelapse() {
     });
     if (stop) stop.addEventListener("click", async () => {
         try { await fetch("/timelapse/stop", { method: "POST" }); } catch (e) {}
+        refresh();
+    });
+    if (sync) sync.addEventListener("click", async () => {
+        sync.disabled = true;
+        try {
+            const r = await (await fetch("/nas/sync", { method: "POST" })).json();
+            if (info) {
+                info.textContent = r.ok
+                    ? ("NAS: uploaded " + r.uploaded + ", queued " + r.pending)
+                    : ("NAS: " + (r.reason || "unavailable") + ", queued " + r.pending);
+            }
+        } catch (e) {}
+        sync.disabled = false;
         refresh();
     });
     refresh();
@@ -723,9 +746,19 @@ window.addEventListener("DOMContentLoaded", initTimelapse);
 <input type="number" id="tl_interval" min="1" step="1" value="60">
 <div class="help">One frame every N seconds at full sensor resolution. "Also save RAW" above is honoured.</div>
 </div>
+<div class="checks">
+<label><input type="checkbox" name="nas_enabled" {% if s.nas_enabled %}checked{% endif %}> Copy frames to NAS</label>
+<label><input type="checkbox" name="nas_delete_local" {% if s.nas_delete_local %}checked{% endif %}> Delete the local copy after upload</label>
+</div>
+<div class="row">
+<label class="title">NAS folder</label>
+<input type="text" name="nas_dir" value="{{ s.nas_dir }}" placeholder="/mnt/nas/silkworm" spellcheck="false" autocomplete="off">
+<div class="help">Mount point of the NAS share on the Pi. Frames are always written locally first and copied here afterwards, so an unreachable NAS never loses a frame - the local folder just grows until it is back.</div>
+</div>
 <div class="topbar-actions" style="justify-content:flex-start;">
 <button type="button" class="power-btn" id="tl_start">Start</button>
 <button type="button" class="power-btn danger" id="tl_stop">Stop</button>
+<button type="button" class="power-btn" id="nas_sync">Sync now</button>
 </div>
 <div class="help" id="tl_status">idle</div>
 </div>
@@ -889,6 +922,13 @@ def read_form():
     SETTINGS["preview_bitrate"] = max(0.0, min(50.0, bitrate))
     SETTINGS["preview_enabled"] = request.form.get("preview_enabled") == "on"
     SETTINGS["focus_mode"] = request.form.get("focus_mode") == "on"
+    # NAS export. The address and credentials stay in the Pi's /etc/fstab; the app
+    # only ever sees the local mount point, so nothing network-specific is stored
+    # here. Empty means "keep frames locally only".
+    SETTINGS["nas_enabled"] = request.form.get("nas_enabled") == "on"
+    SETTINGS["nas_delete_local"] = request.form.get("nas_delete_local") == "on"
+    SETTINGS["nas_dir"] = str(
+        request.form.get("nas_dir", SETTINGS.get("nas_dir", ""))).strip()
     focus_crop = request.form.get("focus_crop", SETTINGS.get("focus_crop", "640x480"))
     SETTINGS["focus_crop"] = focus_crop if focus_crop in FOCUS_CROPS else "640x480"
 
@@ -1006,6 +1046,11 @@ def timelapse_status():
     next_at = float(state.get("next_shot_at", 0) or 0)
     state["countdown_s"] = max(0, int(round(next_at - time.time()))) if state.get("active") else 0
     state["dir"] = str(TIMELAPSE_DIR)
+    nas_ready, nas_reason = nas_check()
+    state["nas_enabled"] = bool(SETTINGS.get("nas_enabled"))
+    state["nas_ready"] = nas_ready
+    state["nas_reason"] = nas_reason
+    state["nas_pending"] = nas_pending()
     return state
 
 
@@ -1033,6 +1078,128 @@ def timelapse_stop():
         _tl_state["active"] = False
     timelapse_save()
     return timelapse_status()
+
+
+# ------------------------------------------------------------------ NAS export
+# Frames are always written locally first and pushed to the NAS afterwards, so a
+# NAS that is slow, unreachable or asleep can never lose a frame. The local
+# folder is a queue; the NAS is the archive. state.json always stays local.
+NAS_RETRY_S = 30.0
+_nas_lock = threading.Lock()
+_nas_next_try = 0.0
+
+
+def nas_target():
+    """Where the NAS share is mounted on the Pi, or None if not configured."""
+    raw = str(SETTINGS.get("nas_dir") or "").strip()
+    return Path(raw).expanduser() if raw else None
+
+
+def nas_check():
+    """Return (ready, reason). Cheap: one stat call when configured."""
+    if not SETTINGS.get("nas_enabled"):
+        return False, "disabled"
+    target = nas_target()
+    if target is None:
+        return False, "no folder set"
+    if not target.is_dir():
+        return False, f"{target} is not mounted"
+    return True, ""
+
+
+def nas_pending():
+    """Number of local files still waiting to be uploaded."""
+    if not TIMELAPSE_DIR.is_dir():
+        return 0
+    count = 0
+    try:
+        for session in TIMELAPSE_DIR.iterdir():
+            if session.is_dir() and session.name.startswith("tl-"):
+                count += sum(1 for f in session.iterdir() if f.is_file())
+    except Exception:
+        pass
+    return count
+
+
+def _nas_put(src, dst):
+    """Copy one file to the NAS: temp name, verify the size, then rename.
+
+    The rename keeps half-written files off the NAS if the link drops mid-copy.
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(dst.name + ".part")
+    shutil.copyfile(src, tmp)
+    try:
+        if tmp.stat().st_size != src.stat().st_size:
+            raise OSError(f"short write: {dst.name}")
+        os.replace(tmp, dst)
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def nas_flush(force=False):
+    """Upload everything queued locally. Never raises, never loses a frame."""
+    global _nas_next_try
+    ready, why = nas_check()
+    if not ready:
+        return {"ok": False, "reason": why, "uploaded": 0, "pending": 0}
+
+    pending = nas_pending()
+    if not pending:
+        with _nas_lock:
+            _nas_next_try = 0.0
+        return {"ok": True, "reason": "", "uploaded": 0, "pending": 0}
+
+    if not force:
+        with _nas_lock:
+            if time.time() < _nas_next_try:
+                return {"ok": True, "reason": "", "uploaded": 0, "pending": pending}
+
+    keep_local = not SETTINGS.get("nas_delete_local", True)
+    target = nas_target()
+    uploaded, failed = 0, ""
+    try:
+        for session in sorted(TIMELAPSE_DIR.iterdir()):
+            if not (session.is_dir() and session.name.startswith("tl-")):
+                continue
+            for src in sorted(session.iterdir()):
+                if not src.is_file():
+                    continue
+                try:
+                    _nas_put(src, target / session.name / src.name)
+                except Exception as exc:          # NAS went away mid-run
+                    failed = str(exc)
+                    break
+                if keep_local:
+                    uploaded += 1
+                else:
+                    try:
+                        src.unlink()
+                        uploaded += 1
+                    except OSError:
+                        pass
+            if failed:
+                break
+            if not keep_local:
+                try:                              # folder fully uploaded
+                    session.rmdir()
+                except OSError:
+                    pass
+    except Exception as exc:
+        failed = str(exc)
+
+    with _nas_lock:
+        _nas_next_try = time.time() + (NAS_RETRY_S if failed else 0.0)
+    return {
+        "ok": not failed,
+        "reason": failed,
+        "uploaded": uploaded,
+        "pending": nas_pending(),
+    }
 
 
 def timelapse_shot():
@@ -1086,12 +1253,17 @@ def timelapse_shot():
 
 
 def timelapse_worker():
-    """Background loop; resumes from state.json after a reboot or crash."""
+    """Background loop; resumes from state.json after a reboot or crash.
+
+    Also drains the upload queue, so a backlog left by an unreachable NAS is
+    pushed as soon as the NAS is back.
+    """
     while True:
         try:
             with _tl_lock:
                 active = bool(_tl_state.get("active"))
                 next_at = float(_tl_state.get("next_shot_at", 0) or 0)
+            nas_flush()
             if not active:
                 time.sleep(1.0)
                 continue
@@ -1291,6 +1463,12 @@ def timelapse_start_route():
 @app.route("/timelapse/stop", methods=["POST"])
 def timelapse_stop_route():
     return jsonify(timelapse_stop())
+
+
+@app.route("/nas/sync", methods=["POST"])
+def nas_sync_route():
+    """Upload the queue now, ignoring the retry backoff."""
+    return jsonify(nas_flush(force=True))
 
 
 @app.route("/record/start", methods=["POST"])
