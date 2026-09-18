@@ -53,6 +53,35 @@ Output layout:
 The *Timelapse* card shows the session name, the frame count and the countdown to
 the next shot.
 
+### Keeping frames on a NAS
+
+A flash card will not hold a long run, so frames can be exported to a NAS share.
+The address and credentials never reach the application: **the Pi mounts the share
+itself**, and the app is only told the local mount point. Set it in the *Timelapse*
+card (it is stored in `settings.json` on the Pi):
+
+```
+# /etc/fstab on the Pi - replace <nas-ip> with your own, keep it out of the repo
+//<nas-ip>/photos  /mnt/nas  cifs  credentials=/etc/nas.cred,nofail,x-systemd.automount,_netdev  0 0
+```
+
+`credentials=` keeps the user and password in a root-only file, while `nofail` and
+`x-systemd.automount` mean an unreachable NAS never blocks boot and the share is
+mounted on first use.
+
+Frames are **always written to the card first** and copied to the NAS afterwards, so
+a NAS that is asleep, slow or unplugged cannot lose a frame. The local folder is a
+queue that is drained as soon as the share is back:
+
+- each file is copied to `<name>.part` on the NAS and renamed only after the size
+  checks out, so half-written files never appear there;
+- `state.json` never leaves the Pi, so resume-after-reboot keeps working even if
+  the NAS is gone entirely;
+- the queue is retried in the background every 30 s, and *Sync now* pushes it
+  immediately;
+- *Delete the local copy after upload* stops the card from filling up — turn it off
+  if you want a local archive as well.
+
 ## Focus helper
 
 Focusing a fixed-focus module on a subject is guesswork unless you can see real
@@ -169,8 +198,8 @@ Everything the app produces lives in `~/camweb/`. None of it is in the repositor
 | `latest.jpg` | the last still |
 | `latest.dng` | the last RAW capture |
 | `camweb.h264` | the last video recording |
-| `timelapse/` | timelapse sessions and `state.json` |
-| `settings.json` | saved camera and lamp settings |
+| `timelapse/` | timelapse sessions and `state.json` — frames waiting to be copied to a NAS are queued here |
+| `settings.json` | saved camera, lamp and NAS settings |
 
 ## Development
 
