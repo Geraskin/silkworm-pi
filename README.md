@@ -69,15 +69,28 @@ card (it is stored in `settings.json` on the Pi):
 `x-systemd.automount` mean an unreachable NAS never blocks boot and the share is
 mounted on first use.
 
+**The folder has to be an actual mount point**, and the app checks that. A path
+that merely exists is dangerous: if the share is not mounted, `/mnt/nas` is an
+ordinary folder on the SD card, so frames would be copied onto the card a second
+time and the rotation would then happily delete the "original" — the copy looks
+safe, but it is on the same disk. For the same reason a folder inside
+`~/camweb/timelapse` is refused. When the check fails, the UI says why and nothing
+is copied or deleted.
+
 Frames are **always written to the card first** and copied to the NAS afterwards, so
 a NAS that is asleep, slow or unplugged cannot lose a frame:
 
 - each file is copied to `<name>.part` on the NAS and renamed only after the size
   checks out, so half-written files never appear there;
+- a frame is itself captured under a temporary name and renamed into place once it
+  is complete, so a sweep running at that moment can never publish a partial image;
 - `state.json` never leaves the Pi, so resume-after-reboot keeps working even if
   the NAS is gone entirely;
 - the sweep runs in the background a few seconds apart, and *Sync now* does it
   immediately.
+
+Sessions that are already fully archived are not looked at again, so a long run
+with thousands of frames does not re-read the whole archive on every pass.
 
 ### The card is a cache, not a queue
 
@@ -94,6 +107,11 @@ instead of quietly eating the archive.
 
 Set the threshold to `0` to keep everything on the card and never clear
 automatically.
+
+The timelapse additionally keeps an absolute floor of 500 MB free and stops the run
+below it. On any card large enough for the percentage to be the bigger number the
+rotation always acts first; the floor is only reached when nothing can be freed at
+all — no NAS, or frames not confirmed on it yet.
 
 ## Focus helper
 
