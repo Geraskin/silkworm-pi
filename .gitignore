@@ -12,6 +12,9 @@ camweb.h264
 settings.json
 timelapse/
 
+# Machine-specific deploy target (Pi address, key path)
+.github/skills/deploy-pi/deploy.env
+
 # Editors / OS
 .vscode/
 .DS_Store

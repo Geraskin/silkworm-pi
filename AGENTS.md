@@ -17,6 +17,7 @@ The app runs on the Pi itself: Flask on `0.0.0.0:8080`.
 - `app_v2.py` — **main (production) version**: Flask UI, extended camera settings, manual exposure, lamp control, power actions, settings saved to `~/camweb/settings.json`.
 - `camera.py` — picamera2 backend: one camera process serves live preview (MJPEG), stills (JPEG + optional DNG) and video (H.264).
 - `app.py` — old basic version (no lamp, no extended settings). Do not touch unless explicitly needed.
+- `README.md` — what the project is (a Raspberry Pi timelapse camera first) and how to install it.
 - `.devcontainer/` — dev environment: Python 3.12, Flask, `gpiozero`, plus `openssh-client` + `rsync` for deployment. SSH keys are forwarded from the host into the container.
 
 ## Technologies
@@ -45,7 +46,7 @@ These files live only on the Pi and are not committed to the repo.
 - Focus mode forces the full-sensor resolution and streams 1:1 centre crops (`/focus`) with denoise off and sharpness neutral, so focus is judged on real pixels, not on ISP sharpening.
 - The Pi's hardware H.264 encoder cannot encode the 8 MP mode: recording switches to a supported size and restores the still resolution afterwards.
 - Preview and video cannot run at the same time (both use the V4L2 encoder); the preview resumes once recording stops.
-- The lamp uses **hardware PWM** (PWM0 on GPIO 18) through `/sys/class/pwm`, enabled by `dtoverlay=pwm,pin=18,func=2` + `dtparam=audio=off` in `/boot/firmware/config.txt`. A one-shot unit (`lamp-pwm.service`) exports the channel at boot and grants group `gpio` write access; `alexey` is in that group. If the channel is missing the app falls back to gpiozero's software PWM, which is much less accurate (duty drifts at high frequency).
+- The lamp uses **hardware PWM** (PWM0 on GPIO 18) through `/sys/class/pwm`, enabled by `dtoverlay=pwm,pin=18,func=2` + `dtparam=audio=off` in `/boot/firmware/config.txt`. A one-shot unit (`lamp-pwm.service`) exports the channel at boot and grants group `gpio` write access; the app's user is in that group. If the channel is missing the app falls back to gpiozero's software PWM, which is much less accurate (duty drifts at high frequency).
 
 ## Skills (superpowers)
 
@@ -64,13 +65,18 @@ Available skills in this repo:
 
 ## Deployment to the Raspberry Pi
 
-- SSH target: `alexey@192.168.10.105` (DHCP IP — `silkworm-pi.local` does **not** resolve inside the dev container, since mDNS does not cross the Docker bridge).
-- SSH key: `~/.ssh/silkworm-pi` (use `IdentitiesOnly=yes`).
-- Pi folder: `~/camweb`
-- Production file: `app_v2.py`
-- Restart: the `camweb` systemd service is installed and enabled; sudo is passwordless for `systemctl restart|status|enable camweb`.
+The connection details are **not** in the repository - they live in the gitignored
+`.github/skills/deploy-pi/deploy.env`. Read that file before deploying; if it is
+missing, copy `deploy.env.example` and fill it in.
 
-Order: verify SSH → upload files with `rsync` → `sudo systemctl restart camweb` → check the response on `:8080`. Full commands are in the `deploy-pi` skill.
+- The Pi's address is DHCP-assigned and can change. `*.local` does **not** resolve
+  inside the dev container, because mDNS does not cross the Docker bridge.
+- Pi folder: `~/camweb` - production file: `app_v2.py`
+- Restart: the `camweb` systemd service is installed and enabled; sudo is
+  passwordless for `systemctl restart|status|enable camweb`.
+
+Order: verify SSH → upload files with `rsync` → `sudo systemctl restart camweb` →
+check the response on `:8080`. Full commands are in the `deploy-pi` skill.
 
 ## Conventions
 

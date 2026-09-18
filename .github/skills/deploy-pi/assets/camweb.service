@@ -3,9 +3,10 @@ Description=Silkworm Pi Camera web app
 After=network.target
 
 [Service]
-User=alexey
-WorkingDirectory=/home/alexey/camweb
-ExecStart=/usr/bin/python3 /home/alexey/camweb/app_v2.py
+# Replace YOUR_PI_USER with the account that owns ~/camweb on your Pi.
+User=YOUR_PI_USER
+WorkingDirectory=/home/YOUR_PI_USER/camweb
+ExecStart=/usr/bin/python3 /home/YOUR_PI_USER/camweb/app_v2.py
 Restart=always
 RestartSec=3
 

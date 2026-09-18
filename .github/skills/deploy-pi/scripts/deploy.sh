@@ -2,15 +2,41 @@
 set -euo pipefail
 
 # Deploy to the Raspberry Pi over SSH: rsync + server restart.
-# Parameters can be overridden via environment variables.
+#
+# Settings are resolved in this order:
+#   1. environment variables,
+#   2. deploy.env next to this skill (gitignored, machine-specific),
+#   3. the generic defaults below.
+# Copy deploy.env.example to deploy.env and fill in your own values.
 
-SSH_TARGET="${SSH_TARGET:-alexey@192.168.10.105}"
-SSH_KEY="${SSH_KEY:-$HOME/.ssh/silkworm-pi}"
+SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENV_FILE="${DEPLOY_ENV:-${SKILL_DIR}/deploy.env}"
+if [[ -f "${ENV_FILE}" ]]; then
+    echo "==> Config: ${ENV_FILE}"
+    # shellcheck disable=SC1090
+    set -a
+    source "${ENV_FILE}"
+    set +a
+fi
+
+SSH_TARGET="${SSH_TARGET:-pi@raspberrypi.local}"
+SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
 REMOTE_DIR="${REMOTE_DIR:-~/camweb}"
 APP_FILES="${APP_FILES:-app_v2.py camera.py}"
 MAIN_MODULE="${MAIN_MODULE:-app_v2.py}"
 SERVICE_NAME="${SERVICE_NAME:-camweb}"
-HEALTH_URL="${HEALTH_URL:-http://192.168.10.105:8080/}"
+
+# Derive the host from the SSH target: drop "user@" and any ":port".
+SSH_HOST="${SSH_TARGET#*@}"
+SSH_HOST="${SSH_HOST%%:*}"
+HEALTH_URL="${HEALTH_URL:-http://${SSH_HOST}:8080/}"
+
+if [[ "${SSH_TARGET}" == "pi@raspberrypi.local" && ! -f "${ENV_FILE}" ]]; then
+    echo "ERROR: SSH_TARGET is not set and ${ENV_FILE} does not exist." >&2
+    echo "       cp ${SKILL_DIR}/deploy.env.example ${ENV_FILE}" >&2
+    echo "       then put your Pi's address in it." >&2
+    exit 1
+fi
 
 SSH_OPTS=(-i "${SSH_KEY}" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=5)
 

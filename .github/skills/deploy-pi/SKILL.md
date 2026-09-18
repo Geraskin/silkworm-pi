@@ -8,23 +8,33 @@ argument-hint: '[files] — which files to upload (default app_v2.py)'
 
 Uploads app files to the Raspberry Pi over SSH and restarts the web server.
 
-## Parameters (defaults)
+## Configuration
+
+Machine-specific values live in **`deploy.env`** next to this file. It is
+gitignored, so the repository never contains your own address or key path:
+
+```bash
+cp .github/skills/deploy-pi/deploy.env.example .github/skills/deploy-pi/deploy.env
+```
+
+Precedence: environment variables → `deploy.env` → the defaults below.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `SSH_TARGET` | `alexey@192.168.10.105` | SSH address (DHCP IP, see note) |
-| `SSH_KEY` | `~/.ssh/silkworm-pi` | private key for the Pi |
+| `SSH_TARGET` | `pi@raspberrypi.local` | SSH address of the Pi |
+| `SSH_KEY` | `~/.ssh/id_ed25519` | private key for the Pi |
 | `REMOTE_DIR` | `~/camweb` | app folder on the Pi |
 | `APP_FILES` | `app_v2.py camera.py` | files to upload (rsync) |
 | `SERVICE_NAME` | `camweb` | systemd service name |
-| `HEALTH_URL` | `http://192.168.10.105:8080/` | health check |
+| `HEALTH_URL` | derived from `SSH_TARGET` | health check |
 
-> **Connection note.** The dev container cannot resolve `*.local` (mDNS does not
-> cross the Docker bridge), so connect by IP with the dedicated key:
-> `ssh -i ~/.ssh/silkworm-pi alexey@192.168.10.105`. The Pi's IP is DHCP-assigned
-> and can change — re-scan with `nmap -Pn -p 22 --open -sV 192.168.10.0/24` if
-> `192.168.10.105` stops answering. The `camweb` systemd service is installed and
-> sudo is passwordless for `systemctl restart|status|enable camweb`.
+> **Connection note.** A dev container usually cannot resolve `*.local` (mDNS does
+> not cross the Docker bridge), so put the Pi's IP in `SSH_TARGET` instead of its
+> hostname. The address is DHCP-assigned and can change - re-scan the subnet with
+> `nmap -Pn -p 22 --open -sV <your-subnet>/24` if the Pi stops answering. The
+> `camweb` systemd service must be installed and enabled (see
+> [camweb.service](./assets/camweb.service)), with passwordless sudo for
+> `systemctl restart|status|enable camweb`.
 
 Production files are `app_v2.py` (Flask UI) and `camera.py` (picamera2 backend). Do not upload `app.py` (old version).
 
@@ -33,7 +43,7 @@ Production files are `app_v2.py` (Flask UI) and `camera.py` (picamera2 backend).
 ### 1. Verify SSH access
 
 ```bash
-ssh -i ~/.ssh/silkworm-pi -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=5 alexey@192.168.10.105 'echo ok'
+ssh -i "${SSH_KEY}" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=5 "${SSH_TARGET}" 'echo ok'
 ```
 
 If it asks for a password, SSH keys are not forwarded (see `.devcontainer/devcontainer.json`, the `~/.ssh` mount).
@@ -41,7 +51,7 @@ If it asks for a password, SSH keys are not forwarded (see `.devcontainer/devcon
 ### 2. Upload files (rsync)
 
 ```bash
-rsync -avz -e "ssh -i ~/.ssh/silkworm-pi -o IdentitiesOnly=yes" app_v2.py camera.py alexey@192.168.10.105:~/camweb/
+rsync -avz -e "ssh -i ${SSH_KEY} -o IdentitiesOnly=yes" ${APP_FILES} "${SSH_TARGET}:${REMOTE_DIR}/"
 ```
 
 Upload app files only. **Do not use `--delete`** — `~/camweb/` on the Pi contains `settings.json` and `latest.jpg`, which must not be overwritten. If several files changed, list them separated by spaces.
@@ -51,19 +61,19 @@ Upload app files only. **Do not use `--delete`** — `~/camweb/` on the Pi conta
 The `camweb` systemd service is installed (unit: [camweb.service](./assets/camweb.service)). Restart it:
 
 ```bash
-ssh -i ~/.ssh/silkworm-pi -o IdentitiesOnly=yes alexey@192.168.10.105 'sudo systemctl restart camweb'
+ssh -i "${SSH_KEY}" -o IdentitiesOnly=yes "${SSH_TARGET}" 'sudo systemctl restart camweb'
 ```
 
 Fallback without systemd:
 
 ```bash
-ssh -i ~/.ssh/silkworm-pi -o IdentitiesOnly=yes alexey@192.168.10.105 "pkill -f 'python3 .*app_v2' || true; cd ~/camweb && nohup python3 app_v2.py > camweb.log 2>&1 & sleep 1; echo started"
+ssh -i "${SSH_KEY}" -o IdentitiesOnly=yes "${SSH_TARGET}" "pkill -f 'python3 .*app_v2' || true; cd ${REMOTE_DIR} && nohup python3 app_v2.py > camweb.log 2>&1 & sleep 1; echo started"
 ```
 
 ### 4. Verify
 
 ```bash
-curl -fsS -o /dev/null -w 'HTTP %{http_code}\n' http://192.168.10.105:8080/
+curl -fsS -o /dev/null -w 'HTTP %{http_code}\n' "${HEALTH_URL}"
 ```
 
 ## Quick start (ready-made script)
@@ -75,15 +85,15 @@ bash .github/skills/deploy-pi/scripts/deploy.sh
 With overridden parameters:
 
 ```bash
-SSH_TARGET=alexey@192.168.10.105 bash .github/skills/deploy-pi/scripts/deploy.sh
+SSH_TARGET=pi@192.168.1.50 bash .github/skills/deploy-pi/scripts/deploy.sh
 ```
 
 The script verifies SSH, uploads files, restarts the server (systemd if available, otherwise fallback) and checks the response.
 
 ## Diagnostics
 
-- systemd logs: `ssh -i ~/.ssh/silkworm-pi alexey@192.168.10.105 'sudo journalctl -u camweb -n 50 --no-pager'`
-- Is the process alive: `ssh -i ~/.ssh/silkworm-pi alexey@192.168.10.105 'pgrep -af python3'`
+- systemd logs: `ssh -i "${SSH_KEY}" "${SSH_TARGET}" 'sudo journalctl -u camweb -n 50 --no-pager'`
+- Is the process alive: `ssh -i "${SSH_KEY}" "${SSH_TARGET}" 'pgrep -af python3'`
 - No response on `:8080`: check that the `camweb` service is active and the port is free.
 
 ## Important
