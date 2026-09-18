@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Local app data (lives on the Pi only, never committed)
+latest.jpg
+latest.dng
+camweb.h264
+settings.json
+timelapse/
+
+# Editors / OS
+.vscode/
+.DS_Store
