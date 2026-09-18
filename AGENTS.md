@@ -77,7 +77,10 @@ missing, copy `deploy.env.example` and fill it in.
   passwordless for `systemctl restart|status|enable camweb`.
 
 Order: verify SSH → upload files with `rsync` → `sudo systemctl restart camweb` →
-check the response on `:8080`. Full commands are in the `deploy-pi` skill.
+check the response on `:8080`. Full commands are in the `deploy-pi` skill, which
+also ships `smoke-test.sh` — it starts a short timelapse, checks the frames, the
+NAS cache and the focus stream on the real hardware, and with `--reboot` verifies
+that an interrupted run resumes.
 
 ## Conventions
 
