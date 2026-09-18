@@ -44,7 +44,7 @@ DEFAULT_SETTINGS = {
     "save_raw": False,
     "nas_enabled": False,
     "nas_dir": "",
-    "nas_delete_local": True,
+    "nas_min_free_percent": 10,
     "light_on": False,
     "light_brightness": 0.5,
     "light_freq": 1000,
@@ -562,6 +562,7 @@ function initTimelapse() {
             } else {
                 text = "idle";
             }
+            text += " · " + s.free_percent + "% free";
             if (s.nas_enabled) {
                 text += " · NAS " + (s.nas_ready ? "ready" : (s.nas_reason || "unavailable"));
                 if (s.nas_pending) { text += ", queued " + s.nas_pending; }
@@ -584,9 +585,12 @@ function initTimelapse() {
         try {
             const r = await (await fetch("/nas/sync", { method: "POST" })).json();
             if (info) {
-                info.textContent = r.ok
+                const head = r.ok
                     ? ("NAS: uploaded " + r.uploaded + ", queued " + r.pending)
                     : ("NAS: " + (r.reason || "unavailable") + ", queued " + r.pending);
+                info.textContent = head
+                    + (r.pruned ? (", cleared " + r.pruned) : "")
+                    + (r.free_percent !== undefined ? (" · " + r.free_percent + "% free") : "");
             }
         } catch (e) {}
         sync.disabled = false;
@@ -748,12 +752,16 @@ window.addEventListener("DOMContentLoaded", initTimelapse);
 </div>
 <div class="checks">
 <label><input type="checkbox" name="nas_enabled" {% if s.nas_enabled %}checked{% endif %}> Copy frames to NAS</label>
-<label><input type="checkbox" name="nas_delete_local" {% if s.nas_delete_local %}checked{% endif %}> Delete the local copy after upload</label>
 </div>
 <div class="row">
 <label class="title">NAS folder</label>
 <input type="text" name="nas_dir" value="{{ s.nas_dir }}" placeholder="/mnt/nas/silkworm" spellcheck="false" autocomplete="off">
-<div class="help">Mount point of the NAS share on the Pi. Frames are always written locally first and copied here afterwards, so an unreachable NAS never loses a frame - the local folder just grows until it is back.</div>
+<div class="help">Mount point of the NAS share on the Pi. Frames are always written locally first and copied here afterwards, so an unreachable NAS never loses a frame - the card keeps them until the share is back.</div>
+</div>
+<div class="row">
+<label class="title">Clear the card below, % free</label>
+<input type="number" name="nas_min_free_percent" min="0" max="50" step="1" value="{{ s.nas_min_free_percent }}">
+<div class="help">Frames stay on the card as long as there is room. Once free space falls below this, the oldest frames that are already safely on the NAS are cleared first. 0 = never clear automatically.</div>
 </div>
 <div class="topbar-actions" style="justify-content:flex-start;">
 <button type="button" class="power-btn" id="tl_start">Start</button>
@@ -926,9 +934,15 @@ def read_form():
     # only ever sees the local mount point, so nothing network-specific is stored
     # here. Empty means "keep frames locally only".
     SETTINGS["nas_enabled"] = request.form.get("nas_enabled") == "on"
-    SETTINGS["nas_delete_local"] = request.form.get("nas_delete_local") == "on"
     SETTINGS["nas_dir"] = str(
         request.form.get("nas_dir", SETTINGS.get("nas_dir", ""))).strip()
+    try:
+        min_free = float(request.form.get(
+            "nas_min_free_percent",
+            SETTINGS.get("nas_min_free_percent", 10)) or 0)
+    except Exception:
+        min_free = 10.0
+    SETTINGS["nas_min_free_percent"] = max(0.0, min(50.0, min_free))
     focus_crop = request.form.get("focus_crop", SETTINGS.get("focus_crop", "640x480"))
     SETTINGS["focus_crop"] = focus_crop if focus_crop in FOCUS_CROPS else "640x480"
 
@@ -1051,6 +1065,9 @@ def timelapse_status():
     state["nas_ready"] = nas_ready
     state["nas_reason"] = nas_reason
     state["nas_pending"] = nas_pending()
+    state["free_percent"] = round(disk_free_percent(), 1)
+    state["min_free_percent"] = float(
+        SETTINGS.get("nas_min_free_percent", 10) or 0)
     return state
 
 
@@ -1082,11 +1099,15 @@ def timelapse_stop():
 
 # ------------------------------------------------------------------ NAS export
 # Frames are always written locally first and pushed to the NAS afterwards, so a
-# NAS that is slow, unreachable or asleep can never lose a frame. The local
-# folder is a queue; the NAS is the archive. state.json always stays local.
-NAS_RETRY_S = 30.0
+# NAS that is slow, unreachable or asleep can never lose a frame. The card acts
+# as a cache in front of the NAS: frames stay there while there is room, and once
+# free space falls below `nas_min_free_percent` the oldest frames that are already
+# safely on the NAS are cleared away. state.json never leaves the Pi.
+NAS_RETRY_S = 30.0        # after a failure
+NAS_MIN_INTERVAL_S = 5.0  # between ordinary sweeps
 _nas_lock = threading.Lock()
 _nas_next_try = 0.0
+_nas_pending = 0          # cached, so the status endpoint stays cheap
 
 
 def nas_target():
@@ -1107,24 +1128,55 @@ def nas_check():
     return True, ""
 
 
-def nas_pending():
-    """Number of local files still waiting to be uploaded."""
-    if not TIMELAPSE_DIR.is_dir():
-        return 0
-    count = 0
+def disk_free_percent():
+    """Free space on the filesystem holding the app data, in percent."""
     try:
-        for session in TIMELAPSE_DIR.iterdir():
-            if session.is_dir() and session.name.startswith("tl-"):
-                count += sum(1 for f in session.iterdir() if f.is_file())
+        total, _, free = shutil.disk_usage(BASE_DIR)
+        return 100.0 * free / total if total else 100.0
     except Exception:
-        pass
-    return count
+        return 100.0
+
+
+def nas_pending():
+    """Files still waiting for the NAS as of the last sweep. Cheap on purpose."""
+    return _nas_pending
+
+
+def nas_sessions():
+    """Local session folders, oldest first (the names sort chronologically)."""
+    if not TIMELAPSE_DIR.is_dir():
+        return []
+    try:
+        return sorted(p for p in TIMELAPSE_DIR.iterdir()
+                      if p.is_dir() and p.name.startswith("tl-"))
+    except Exception:
+        return []
+
+
+def _local_file_count():
+    try:
+        return sum(1 for s in nas_sessions() for p in s.iterdir() if p.is_file())
+    except OSError:
+        return _nas_pending
+
+
+def _nas_listing(session_dir):
+    """Names already on the NAS for one session - a single listing call.
+
+    _nas_put renames only after checking the size, so anything present under its
+    final name is complete and never needs uploading a second time.
+    """
+    try:
+        return {p.name for p in session_dir.iterdir()}
+    except OSError:
+        return set()
 
 
 def _nas_put(src, dst):
     """Copy one file to the NAS: temp name, verify the size, then rename.
 
-    The rename keeps half-written files off the NAS if the link drops mid-copy.
+    The rename keeps half-written files off the NAS if the link drops mid-copy,
+    and it is what lets a sweep tell what is missing from a directory listing.
     """
     dst.parent.mkdir(parents=True, exist_ok=True)
     tmp = dst.with_name(dst.name + ".part")
@@ -1142,64 +1194,99 @@ def _nas_put(src, dst):
 
 
 def nas_flush(force=False):
-    """Upload everything queued locally. Never raises, never loses a frame."""
-    global _nas_next_try
+    """Upload whatever the NAS is missing, then report what is still local.
+
+    Never raises and never loses a frame: local copies are left in place, so a
+    failure just means the next sweep tries again.
+    """
+    global _nas_next_try, _nas_pending
     ready, why = nas_check()
     if not ready:
-        return {"ok": False, "reason": why, "uploaded": 0, "pending": 0}
+        _nas_pending = _local_file_count()
+        return {"ok": False, "reason": why, "uploaded": 0,
+                "pending": _nas_pending}
 
-    pending = nas_pending()
-    if not pending:
-        with _nas_lock:
-            _nas_next_try = 0.0
-        return {"ok": True, "reason": "", "uploaded": 0, "pending": 0}
+    with _nas_lock:                  # also stops a manual sweep from racing this
+        if not force and time.time() < _nas_next_try:
+            return {"ok": True, "reason": "", "uploaded": 0,
+                    "pending": _nas_pending}
 
-    if not force:
-        with _nas_lock:
-            if time.time() < _nas_next_try:
-                return {"ok": True, "reason": "", "uploaded": 0, "pending": pending}
+        target = nas_target()
+        uploaded, pending, failed = 0, 0, ""
+        try:
+            for session in nas_sessions():
+                on_nas = _nas_listing(target / session.name)
+                try:
+                    names = sorted(p for p in session.iterdir() if p.is_file())
+                except OSError:
+                    continue
+                for src in names:
+                    if src.name in on_nas:
+                        continue
+                    pending += 1
+                    if failed:
+                        continue
+                    try:
+                        _nas_put(src, target / session.name / src.name)
+                    except Exception as exc:      # the NAS went away mid-run
+                        failed = str(exc)
+                        continue
+                    uploaded += 1
+                    pending -= 1
+        except Exception as exc:
+            failed = str(exc)
 
-    keep_local = not SETTINGS.get("nas_delete_local", True)
+        _nas_pending = pending
+        _nas_next_try = time.time() + (NAS_RETRY_S if failed else NAS_MIN_INTERVAL_S)
+
+    return {"ok": not failed, "reason": failed,
+            "uploaded": uploaded, "pending": _nas_pending}
+
+
+def nas_prune():
+    """Clear the oldest frames that are already on the NAS when space runs low.
+
+    Only runs below `nas_min_free_percent`, and only removes a local file once its
+    NAS copy is confirmed to exist with the same size - so the rotation can never
+    delete the only copy of a frame. Frames not on the NAS yet are left alone,
+    which is what makes an unreachable NAS safe: nothing is deleted and the
+    timelapse's own low-disk guard stops the run instead.
+    """
+    percent = float(SETTINGS.get("nas_min_free_percent", 0) or 0)
+    if percent <= 0 or not SETTINGS.get("nas_enabled"):
+        return 0
     target = nas_target()
-    uploaded, failed = 0, ""
-    try:
-        for session in sorted(TIMELAPSE_DIR.iterdir()):
-            if not (session.is_dir() and session.name.startswith("tl-")):
+    if target is None or not target.is_dir():
+        return 0
+    if disk_free_percent() >= percent:
+        return 0
+
+    pruned = 0
+    with _nas_lock:
+        for session in nas_sessions():                    # oldest first
+            try:
+                local = sorted(p for p in session.iterdir() if p.is_file())
+            except OSError:
                 continue
-            for src in sorted(session.iterdir()):
-                if not src.is_file():
+            for src in local:
+                if disk_free_percent() >= percent:
+                    return pruned
+                dst = target / session.name / src.name
+                try:
+                    if not dst.is_file() or dst.stat().st_size != src.stat().st_size:
+                        continue                          # not safely on the NAS
+                except OSError:
                     continue
                 try:
-                    _nas_put(src, target / session.name / src.name)
-                except Exception as exc:          # NAS went away mid-run
-                    failed = str(exc)
-                    break
-                if keep_local:
-                    uploaded += 1
-                else:
-                    try:
-                        src.unlink()
-                        uploaded += 1
-                    except OSError:
-                        pass
-            if failed:
-                break
-            if not keep_local:
-                try:                              # folder fully uploaded
-                    session.rmdir()
+                    src.unlink()
+                    pruned += 1
                 except OSError:
                     pass
-    except Exception as exc:
-        failed = str(exc)
-
-    with _nas_lock:
-        _nas_next_try = time.time() + (NAS_RETRY_S if failed else 0.0)
-    return {
-        "ok": not failed,
-        "reason": failed,
-        "uploaded": uploaded,
-        "pending": nas_pending(),
-    }
+            try:
+                session.rmdir()                           # gone once every frame left
+            except OSError:
+                pass
+    return pruned
 
 
 def timelapse_shot():
@@ -1264,6 +1351,7 @@ def timelapse_worker():
                 active = bool(_tl_state.get("active"))
                 next_at = float(_tl_state.get("next_shot_at", 0) or 0)
             nas_flush()
+            nas_prune()
             if not active:
                 time.sleep(1.0)
                 continue
@@ -1467,8 +1555,11 @@ def timelapse_stop_route():
 
 @app.route("/nas/sync", methods=["POST"])
 def nas_sync_route():
-    """Upload the queue now, ignoring the retry backoff."""
-    return jsonify(nas_flush(force=True))
+    """Sweep now, ignoring the regular interval."""
+    result = nas_flush(force=True)
+    result["pruned"] = nas_prune()
+    result["free_percent"] = round(disk_free_percent(), 1)
+    return jsonify(result)
 
 
 @app.route("/record/start", methods=["POST"])
