@@ -58,13 +58,35 @@ Skills are bundles of instructions and scripts that the agent loads **on demand*
 Usage rules:
 1. If a task matches a skill's description, first read its `SKILL.md` fully and follow the procedure.
 2. Resource paths inside a skill are relative to the skill, using `./`.
-3. Do not hard-code deploy commands in code — use the skill.
+3. Do not hard-code commands a skill already provides — use the skill.
+4. Look through **both** tables below before starting a task. Most of the skills available here live outside this repository: they are installed with the editor and are as much part of the toolset as the one in here.
 
-Available skills in this repo:
+### In this repo — `.github/skills/<name>/SKILL.md`
 
 | Skill | When to use |
 |-------|-------------|
 | `deploy-pi` | "deploy", "update on the Pi", "upload over SSH", "restart the server on the Raspberry Pi" |
+
+### Installed with the editor — outside the repo
+
+These are not part of the repository and must not be copied into it. Their paths
+are absolute and carry an extension version, so they change on every update:
+read the path from the skill list you are given, never from a note kept here.
+
+| Skill | When to use |
+|-------|-------------|
+| `chronicle` | standup summaries, usage tips, searching past sessions |
+| `agent-customization` | writing or repairing `SKILL.md`, `AGENTS.md`, `.instructions.md`, `.prompt.md`, `.agent.md` |
+| `create-skill`, `create-instructions`, `create-prompt`, `create-agent`, `create-hook`, `init`, `troubleshoot` | creating those files, or an editor setup from scratch |
+| `get-search-view-results` | reading what the user has open in the VS Code Search view |
+| `install-vscode-extension`, `project-setup-info-local`, `project-setup-info-context7` | scaffolding a project or setting up extensions |
+| `python-fact-grounded-coding` | Python work that has to be grounded in verified facts — diagnostics, runtime values, tests — rather than assumptions |
+| `pylance-docs` | Pylance settings, diagnostics or feature behaviour |
+| `pylance-refactoring` | named refactorings: unused imports, inferred type annotations, fix-all |
+| `pylance-python-profiling` | profiling Python for CPU, calls or memory |
+| `create-pull-request`, `address-pr-comments` | opening a PR, working through review comments |
+| `summarize-github-issue-pr-notification`, `suggest-fix-issue` | reading an issue, a PR or a notification, and proposing a fix |
+| `form-github-search-query`, `show-github-search-result` | searching GitHub, and presenting what was found |
 
 ## Deployment to the Raspberry Pi
 
