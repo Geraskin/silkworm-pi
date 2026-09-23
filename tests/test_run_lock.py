@@ -174,8 +174,12 @@ try:
           fake.calls.index("measure") < len(fake.calls), fake.calls)
     check("the lamp is on while the measurement is taken",
           lit and lit[0] is True, lit)
-    check("the lamp goes back to the user's state afterwards",
-          len(lit) > 1 and lit[-1] is None, lit)
+    check("the lamp goes back to the user's state after the measurement",
+          len(lit) > 1 and lit[-2] is None, lit)
+    # ...and then the run itself goes dark: a lamp left burning would stand in
+    # every frame and heat the box. A run is lit per frame, not for its length.
+    check("the run starts with the lamp dark",
+          lit[-1] is False, lit)
 
     locked = app.effective_controls().get("locked")
     check("every frame is shot with the measured values",
@@ -216,8 +220,8 @@ try:
           state["locked"] is False, state["locked"])
     check("an unlocked run has no lock in its controls",
           "locked" not in app.effective_controls())
-    check("a failed measurement still puts the lamp back",
-          lit and lit[-1] is None, lit)
+    check("a failed measurement still leaves the lamp off, not lit",
+          lit and lit[-1] is False, lit)
     app.timelapse_stop()
 
     # A camera that answers with nothing useful is the same as a failure.

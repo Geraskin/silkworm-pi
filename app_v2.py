@@ -515,6 +515,23 @@ def _lamp_number(value, default, lo, hi):
         return default
 
 
+def _lamp_between_shots():
+    """What the lamp does while no frame is being taken.
+
+    `False` while a run is going, `None` (= "whatever the user set") otherwise.
+
+    A run borrows the lamp for each frame and gives it back in between. A lamp
+    switched on by hand must not burn through the run: it would stand in every
+    frame as a light source and a shadow, cook the subject, and in a closed box
+    heat both the lamp and the camera - and a hot lamp has a different colour
+    from a cold one. Outside a run the switch means what it says, because the
+    preview needs the light while the shot is being set up.
+    """
+    if SETTINGS.get("light_flash") and timelapse_active():
+        return False
+    return None
+
+
 @contextmanager
 def lamp_lit():
     """The lamp on at the flash brightness for as long as the block runs.
@@ -530,7 +547,7 @@ def lamp_lit():
     try:
         yield True
     finally:
-        apply_light()
+        apply_light(on=_lamp_between_shots())
 
 
 def _light_lead_s():
@@ -2252,6 +2269,10 @@ def timelapse_start(interval_s, max_s=0.0):
             "min_free_mb": 500,
             "last_error": "",
         })
+    # A run is dark between its frames, so it starts dark: the switch the user
+    # pressed means "light the box", not "leave it lit through the run".
+    if SETTINGS.get("light_flash"):
+        apply_light(on=False)
     timelapse_save()
     camera.apply_controls(effective_controls())   # pin what was just measured
     timelapse_write_meta(session)
@@ -2265,6 +2286,8 @@ def timelapse_stop(reason=""):
         _tl_state["stop_reason"] = str(reason or "")
     timelapse_save()
     timelapse_write_meta()
+    # The run is over, so the lamp goes back to what the switch says.
+    apply_light()
     # The scene is the camera's to judge again, for the preview and for photos.
     # The values stay in the state, so the record still says how it was shot.
     camera.apply_controls(effective_controls())
