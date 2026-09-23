@@ -3,6 +3,7 @@
 Nothing here needs a Pi: the driver is replaced by stubs that record the order
 and the values of the writes, which is all the logic to check.
 """
+import json
 import re
 import shutil
 import sys
@@ -159,6 +160,96 @@ try:
     check("a run without the flash leaves the lamp where the user put it",
           app.LIGHT_PWM.value is None, app.LIGHT_PWM.value)
     app.timelapse_stop()
+
+    # ------------------------------------------- a resumed run starts dark too
+    # A restart is what every deploy is, and the run it restores is just as lit
+    # per frame as one that was started: without this the lamp would burn from
+    # the restart until the next frame, which on a long interval is most of it.
+    app.SETTINGS.update(light_flash=True, light_on=True, light_brightness=0.5)
+    app.TIMELAPSE_DIR.mkdir(parents=True, exist_ok=True)
+    app.TL_STATE_PATH.write_text(json.dumps({
+        "active": True, "session": "tl-20260923-140000", "interval_s": 600.0,
+        "max_s": 0.0, "frames": 3, "started_at": "2026-09-23T14:00:00",
+        "started_at_epoch": time.time() - 60},
+    ), encoding="utf-8")
+    reset()
+    app.timelapse_load()
+    check("a run resumed from the state file is dark as well",
+          app.LIGHT_PWM.value == 0.0, app.LIGHT_PWM.value)
+    with app._tl_lock:
+        app._tl_state["active"] = False
+
+    # ------------------------------ a run stopped for want of disk space: the
+    # second of the two places a run can end, and the lamp has to come back here
+    # too, or the switch would say on with the box dark.
+    app.SETTINGS.update(light_flash=True, light_on=True, light_brightness=0.5)
+    with app._tl_lock:
+        app._tl_state.update({"active": True, "session": "tl-20260923-140100",
+                              "interval_s": 60.0, "max_s": 0.0, "frames": 0,
+                              "min_free_mb": 10 ** 9})
+    reset()
+    app.timelapse_shot()
+    check("a run stopped for want of disk space hands the lamp back",
+          app.LIGHT_PWM.value == 0.5, app.LIGHT_PWM.value)
+    check("...and that run really is over", app._tl_state["active"] is False)
+
+    # ------------------------------------ a stop that lands during a frame must
+    # not change the light in the middle of the exposure: the frame would come
+    # out dark and still be counted.
+    app.SETTINGS.update(light_flash=True, light_on=True, light_brightness=0.5)
+    with app._tl_lock:
+        app._tl_state.update({"active": True, "session": "tl-20260923-140200",
+                              "interval_s": 60.0, "max_s": 0.0, "frames": 1})
+    reset()
+    app.capture_lock.acquire()
+    try:
+        app.timelapse_stop()
+        check("a stop during a frame leaves the lamp where it is",
+              app.LIGHT_PWM.value is None, app.LIGHT_PWM.value)
+        check("...and the run ends anyway", app._tl_state["active"] is False)
+    finally:
+        app.capture_lock.release()
+    reset()
+    app.timelapse_stop()
+    check("a stop with nothing in flight hands the lamp back",
+          app.LIGHT_PWM.value == 0.5, app.LIGHT_PWM.value)
+
+    # ------------------------------------------- the plain form is refused too
+    # It posts to the page's own address, and read_form() would rewrite the
+    # settings - the flash among them, which now also picks the lamp's state
+    # between frames.
+    with app._tl_lock:
+        app._tl_state.update({"active": True, "session": "tl-20260923-140300",
+                              "interval_s": 60.0, "max_s": 0.0, "frames": 2})
+    plain = app.app.test_client().post("/")
+    check("a plain form post is refused while a run is going",
+          plain.status_code == 409 and "stop it first" in plain.get_data(as_text=True),
+          (plain.status_code, plain.get_data(as_text=True)[:60]))
+    with app._tl_lock:
+        app._tl_state["active"] = False
+
+    # -------------------------------------- a write that fails is not remembered
+    # The cache is written after the hardware, so a failed write is retried
+    # rather than skipped as "already done".
+    app.SETTINGS.update(light_on=True, light_brightness=0.5)
+    reset()
+
+    class Boom:
+        def on(self):
+            raise RuntimeError("no pwm today")
+
+        def off(self):
+            raise RuntimeError("no pwm today")
+
+    real_stby = app.LIGHT_STBY
+    app.LIGHT_STBY = Boom()
+    try:
+        app.apply_light(on=True)
+    except RuntimeError:
+        pass
+    app.LIGHT_STBY = real_stby
+    check("a lamp write that fails is not remembered as done",
+          app._LIGHT_STATE["on"] is None, app._LIGHT_STATE)
 
     # ------------------------------------------------------------- what the form does
     html = app.app.test_client().get("/").data.decode()

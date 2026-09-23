@@ -452,6 +452,8 @@ except Exception:
 
 # Last applied lamp state, so redundant PWM writes are skipped.
 _LIGHT_STATE = {"on": None, "duty_pct": None, "freq": None}
+# The worker takes frames while Flask answers requests, so two calls can meet.
+_LIGHT_LOCK = threading.Lock()
 
 
 def apply_light(on=None, brightness=None):
@@ -464,6 +466,11 @@ def apply_light(on=None, brightness=None):
     `on` and `brightness` override the stored settings for this one call, which
     is how a shot borrows the lamp for its own exposure without disturbing what
     the user set.
+
+    Serialised, because the worker takes frames while Flask is answering
+    requests: two calls meeting halfway through could leave the four lines in a
+    state neither of them asked for, and the lamp lit with the cache saying
+    otherwise.
     """
     if not GPIO_AVAILABLE:
         return
@@ -481,27 +488,32 @@ def apply_light(on=None, brightness=None):
         freq = max(1, min(10000, int(SETTINGS.get("light_freq", 1000))))
     except Exception:
         freq = 1000
-    changed_freq = freq != _LIGHT_STATE["freq"]
-    if not changed_freq and on == _LIGHT_STATE["on"] and duty_pct == _LIGHT_STATE["duty_pct"]:
-        return
-    if changed_freq:
-        try:
-            LIGHT_PWM.frequency = freq
-        except Exception:
-            pass
+    with _LIGHT_LOCK:
+        changed_freq = freq != _LIGHT_STATE["freq"]
+        if (not changed_freq and on == _LIGHT_STATE["on"]
+                and duty_pct == _LIGHT_STATE["duty_pct"]):
+            return
+        if changed_freq:
+            try:
+                LIGHT_PWM.frequency = freq
+            except Exception:
+                pass
+        if on:
+            LIGHT_STBY.on()
+            LIGHT_AIN1.on()
+            LIGHT_AIN2.off()
+            LIGHT_PWM.value = duty_pct / 100
+        else:
+            LIGHT_PWM.off()
+            LIGHT_AIN1.off()
+            LIGHT_AIN2.off()
+            LIGHT_STBY.off()
+        # Recorded only once the hardware has taken it: a write that raises must
+        # not leave the cache claiming a state the lamp is not in, or the next
+        # call would skip the write that would have put it right.
         _LIGHT_STATE["freq"] = freq
-    _LIGHT_STATE["on"] = on
-    _LIGHT_STATE["duty_pct"] = duty_pct
-    if on:
-        LIGHT_STBY.on()
-        LIGHT_AIN1.on()
-        LIGHT_AIN2.off()
-        LIGHT_PWM.value = duty_pct / 100
-    else:
-        LIGHT_PWM.off()
-        LIGHT_AIN1.off()
-        LIGHT_AIN2.off()
-        LIGHT_STBY.off()
+        _LIGHT_STATE["on"] = on
+        _LIGHT_STATE["duty_pct"] = duty_pct
 
 
 apply_light()
@@ -530,6 +542,34 @@ def _lamp_between_shots():
     if SETTINGS.get("light_flash") and timelapse_active():
         return False
     return None
+
+
+def _darken_for_run():
+    """Put the lamp out while a run is going.
+
+    Used where a run becomes active without a start: a run resumed from
+    state.json after a restart, which is what every deploy is. Without it a lamp
+    the user switched on would burn from the restart until the next frame - on a
+    long interval, most of the run.
+    """
+    if SETTINGS.get("light_flash") and timelapse_active():
+        apply_light(on=False)
+
+
+def _hand_back_lamp():
+    """Give the lamp back to the switch now that a run is over.
+
+    Not while a frame is still being taken: the lamp must not change brightness
+    in the middle of an exposure - the frame would come out dark or dim and
+    still be counted. The frame's own exit hands the lamp back in that case,
+    because by then the run is no longer active.
+    """
+    if not capture_lock.acquire(blocking=False):
+        return
+    try:
+        apply_light()
+    finally:
+        capture_lock.release()
 
 
 @contextmanager
@@ -561,9 +601,11 @@ def light_for_shot():
 
     A frame taken in the dark is useless, but a lamp left on through a run that
     lasts days would cook the subject and waste power, so it is borrowed for the
-    frame instead of switched on for the run. Afterwards it goes back to whatever
-    the user set, so this can run per frame for days without touching their
-    choice.
+    frame instead of switched on for the run. Between the frames of a run it goes
+    out rather than back to the switch: a lamp left burning would stand in the
+    next frame as a light source and a shadow and, in a closed box, keep the lamp
+    and the camera hot. Outside a run it goes back to whatever the user set, so
+    this can run per frame for days without touching their choice.
 
     The lead is not only for the lamp to warm up. While it is off the scene is
     black and the auto white balance has nothing to converge on: measured on the
@@ -1602,7 +1644,7 @@ window.addEventListener("DOMContentLoaded", initShotNumbers);
 <div class="row">
 <label class="title">Lead time, seconds</label>
 <input type="number" name="light_flash_lead_s" form="capture_form" min="0" max="30" step="0.5" value="{{ s.light_flash_lead_s }}">
-<div class="help">With "Light every shot" the lamp comes on this long before the shutter and goes off again after it, so a run that lasts days does not keep the subject lit or the lamp hot. The lead matters more than it looks: while the lamp is off the scene is black and the auto white balance has nothing to work with, so a shot taken too soon after it comes on is tinted blue - measured here, 1 s leaves frames about 30 % heavy in blue, 3 s is clean. Leave it at 3 unless you have a reason not to.</div>
+<div class="help">With "Light every shot" the lamp comes on this long before the shutter and goes off again after it, so a run that lasts days does not keep the subject lit or the lamp hot. The lead matters more than it looks: while the lamp is off the scene is black and the auto white balance has nothing to work with, so a shot taken too soon after it comes on is tinted blue - measured here, 1 s leaves frames about 30 % heavy in blue, 3 s is clean. Leave it at 3 unless you have a reason not to. Between the frames of a run the lamp is off, so every frame starts from a black scene: a run that could not measure its exposure has nothing pinned, and each frame's camera has only this lead to settle on - do not set it to 0 there.</div>
 </div>
 </div>
 </section>
@@ -1923,6 +1965,8 @@ def timelapse_load():
         state["started_at_epoch"] = _parse_started_at(state.get("started_at"))
     with _tl_lock:
         _tl_state = state
+    # A run restored from the file is dark between its frames too.
+    _darken_for_run()
     return state
 
 
@@ -2246,6 +2290,10 @@ def timelapse_start(interval_s, max_s=0.0):
     focus_mode_off("a run is starting")
     lock = _measure_run_lock()
     session = _new_session_name()
+    # A run is lit per frame and dark in between, so it starts dark - and before
+    # the run is published, so that no frame can begin between the two.
+    if SETTINGS.get("light_flash"):
+        apply_light(on=False)
     with _tl_lock:
         _tl_state.update({
             "active": True,
@@ -2269,10 +2317,6 @@ def timelapse_start(interval_s, max_s=0.0):
             "min_free_mb": 500,
             "last_error": "",
         })
-    # A run is dark between its frames, so it starts dark: the switch the user
-    # pressed means "light the box", not "leave it lit through the run".
-    if SETTINGS.get("light_flash"):
-        apply_light(on=False)
     timelapse_save()
     camera.apply_controls(effective_controls())   # pin what was just measured
     timelapse_write_meta(session)
@@ -2286,8 +2330,9 @@ def timelapse_stop(reason=""):
         _tl_state["stop_reason"] = str(reason or "")
     timelapse_save()
     timelapse_write_meta()
-    # The run is over, so the lamp goes back to what the switch says.
-    apply_light()
+    # The run is over, so the lamp goes back to what the switch says - but not
+    # into the middle of a frame that is still being taken.
+    _hand_back_lamp()
     # The scene is the camera's to judge again, for the preview and for photos.
     # The values stay in the state, so the record still says how it was shot.
     camera.apply_controls(effective_controls())
@@ -2701,6 +2746,9 @@ def timelapse_shot():
             _tl_state["active"] = False
             _tl_state["last_error"] = "stopped: low disk space"
         timelapse_save()
+        # The second of the two places a run can end, so the lamp goes back to
+        # the switch here as well.
+        _hand_back_lamp()
         camera.apply_controls(effective_controls())
         return
 
@@ -2956,6 +3004,12 @@ def _one_browser_at_a_time():
     otherwise show an error page instead of the notice it is already displaying.
     """
     path = request.path
+    # The plain form posts to the page's own address. That address is exempt from
+    # the lease so a page can load at all, but a post there during a run still
+    # has to be refused: it would take a still and rewrite the settings - the
+    # flash among them, which now also picks what the lamp does between frames.
+    if path == "/" and request.method == "POST" and timelapse_active():
+        return jsonify(error="a timelapse is running - stop it first"), 409
     if path in LEASE_EXEMPT or path.startswith("/static/"):
         return None
     if path in RUN_LOCKED and timelapse_active():
