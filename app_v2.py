@@ -655,6 +655,24 @@ button:disabled { opacity:.55; cursor:wait; }
 .focus-history { display:flex; align-items:flex-end; gap:1px; height:20px; }
 .focus-history i { flex:1; min-height:1px; background:#c8cdd6; }
 .focus-history i.now { background:var(--primary); }
+/* The run panel. While a run is going this is the only thing on the page that
+   changes, so it is laid out to be read at a glance - and the last frame is
+   kept small, because what it is for is confirming that the run is shooting
+   what it should, not for looking at the picture. */
+.run-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(215px,1fr)); gap:0 20px; margin-top:10px; }
+.run-grid .kv {
+    display:flex; justify-content:space-between; gap:12px; padding:3px 0;
+    border-bottom:1px solid var(--line); font-size:13px;
+}
+.run-grid .kv span { color:var(--muted); }
+.run-grid .kv b { font-weight:650; font-variant-numeric:tabular-nums; text-align:right; }
+.run-bar { height:8px; margin-top:10px; border-radius:4px; background:#e6e9ee; overflow:hidden; }
+.run-bar i { display:block; height:100%; width:0; background:var(--primary); transition:width .2s linear; }
+.run-last { margin-top:12px; }
+.run-last img {
+    display:block; width:100%; max-width:320px; height:auto;
+    border:1px solid var(--line); border-radius:8px; background:#111;
+}
 details { margin-top:14px; }
 summary { cursor:pointer; font-weight:650; }
 .mono {
@@ -1040,39 +1058,144 @@ function initTimelapse() {
     const maxField = document.getElementById("tl_max");
     const maxUnit = document.getElementById("tl_max_unit");
 
+    // A row of the run panel: what it is called on the left, what it is on the
+    // right, so a column of them reads like a report rather than a paragraph.
+    function kv(label, value) {
+        const row = document.createElement("div");
+        row.className = "kv";
+        const k = document.createElement("span");
+        k.textContent = label;
+        const v = document.createElement("b");
+        v.textContent = value;
+        row.appendChild(k);
+        row.appendChild(v);
+        return row;
+    }
+
+    function formatSize(bytes) {
+        if (!bytes) { return "0"; }
+        const m = bytes / (1024 * 1024);
+        if (m >= 1024) { return (m / 1024).toFixed(2) + " GB"; }
+        return (m >= 10 ? m.toFixed(1) : m.toFixed(2)) + " MB";
+    }
+
+    function frameSrc(session, name) {
+        return "/timelapse/frame/" + encodeURIComponent(session)
+            + "/" + encodeURIComponent(name);
+    }
+
     // While a run is going, what is on screen is the run: what it has fixed, how
-    // far along it is, and the frames it has already taken.
+    // far along it is, what it is costing in space, and the frame it took last.
     async function refreshRun(s) {
+        const panel = document.getElementById("run_panel");
+        const grid = document.getElementById("run_grid");
         const strip = document.getElementById("run_frames");
+        const earlier = document.getElementById("run_earlier");
         const stats = document.getElementById("run_stats");
-        if (!strip || !stats) return;
+        if (!panel || !grid || !strip || !stats) return;
         if (!s.active) {
-            strip.style.display = "none";
+            panel.style.display = "none";
             stats.style.display = "none";
             strip.dataset.count = "";
             return;
         }
+        panel.style.display = "";
+        const p = s.plan || {};
+        const w = s.shot_with || {};
+        const lock = s.lock || {};
+        const fixed = !!(s.locked && lock.exposure_us);
+        const perFrame = s.avg_frame_bytes || 0;
+
+        grid.innerHTML = "";
+        grid.appendChild(kv("Frames taken",
+            p.planned ? (p.taken + " of " + p.planned) : String(p.taken)));
+        grid.appendChild(kv("Frames to go",
+            (p.left === null || p.left === undefined)
+                ? "until you stop it" : String(p.left)));
+        grid.appendChild(kv("Every", formatSpan(p.interval_s)));
+        grid.appendChild(kv("Running for", formatSpan(p.elapsed_s)
+            + (typeof p.left_s === "number"
+                ? (" · " + formatSpan(p.left_s) + " left") : "")));
+        grid.appendChild(kv("Next frame",
+            typeof p.next_s === "number" ? ("in " + p.next_s + " s") : "—"));
+        grid.appendChild(kv("Resolution", (w.resolution || "?")
+            + (w.save_raw ? " + RAW" : "")
+            + (w.rotation ? (" · rotate " + w.rotation + "°") : "")
+            + (w.quality ? (" · q" + w.quality) : "")));
+        grid.appendChild(kv("Exposure", fixed
+            ? (formatShutter(lock.exposure_us) + " · gain " + lock.gain
+               + (lock.chosen_by === "hand" ? " (yours)" : " (measured)"))
+            : "the camera's own choice"));
+        grid.appendChild(kv("White balance", fixed && lock.colour_gains
+            ? (lock.colour_gains.join(" / ") + (w.awb ? (" · " + w.awb) : ""))
+            : (w.awb || "auto")));
+        grid.appendChild(kv("Denoise · metering",
+            (w.denoise || "?") + " · " + (w.metering || "?")));
+        grid.appendChild(kv("Light", w.light_flash
+            ? ("every shot · " + Math.round((w.light_flash_brightness || 1) * 100)
+               + "% · lead " + (w.light_flash_lead_s || 0) + " s")
+            : (w.light_on ? "on" : "off")));
+        grid.appendChild(kv("Room on the card",
+            s.free_percent + "% · " + formatSize((s.free_mb || 0) * 1024 * 1024)));
+        grid.appendChild(kv("This run so far", formatSize(s.session_bytes)
+            + (perFrame ? (" · " + formatSize(perFrame) + " a frame") : "")));
+        grid.appendChild(kv("At this rate", s.estimated_bytes
+            ? (formatSize(s.estimated_bytes) + " in all") : "—"));
+        grid.appendChild(kv("NAS", s.nas_enabled
+            ? ((s.nas_ready ? "ready" : (s.nas_reason || "unavailable"))
+               + (s.nas_pending ? (" · queued " + s.nas_pending) : ""))
+            : "off"));
+
+        const bar = document.getElementById("run_bar_fill");
+        if (bar) {
+            bar.style.width = (typeof p.done_fraction === "number"
+                ? (p.done_fraction * 100).toFixed(1) : "0") + "%";
+        }
         stats.style.display = "";
-        stats.textContent = "frames " + s.frames + " · started " + (s.started_at || "?")
-            + " · every " + formatSpan(s.interval_s)
-            + (typeof s.remaining_s === "number" ? (" · " + formatSpan(s.remaining_s) + " left") : "")
-            + " · " + s.free_percent + "% free"
-            + (s.nas_enabled ? (" · NAS " + (s.nas_ready ? "ready" : "unavailable")
-                + (s.nas_pending ? (", queued " + s.nas_pending) : "")) : "")
+        stats.textContent = "started " + (s.started_at || "?")
             + (s.last_shot && s.last_shot.exposure_us
                 ? (" · last frame " + formatShutter(s.last_shot.exposure_us)
-                   + " at gain " + s.last_shot.gain) : "");
+                   + " at gain " + s.last_shot.gain) : "")
+            + (s.last_error ? (" · " + s.last_error) : "");
         let list;
         try {
             list = await (await fetch("/timelapse/frames", { cache: "no-store" })).json();
         } catch (e) { return; }
+
+        // The frame that was taken last gets a place of its own - at a size that
+        // does not take the screen over, because what it is for is seeing that
+        // the run is shooting what it should, not watching the run.
+        const last = list.frames.length ? list.frames[list.frames.length - 1] : null;
+        const img = document.getElementById("run_last_img");
+        const link = document.getElementById("run_last_link");
+        const meta = document.getElementById("run_last_meta");
+        if (last && img && link && meta) {
+            const src = frameSrc(list.session, last.name);
+            // Fetched only when there is a new frame: the panel is redrawn every
+            // few seconds and the picture must not flicker with it.
+            if (img.dataset.name !== last.name) {
+                img.dataset.name = last.name;
+                img.src = src + "?w=320";
+            }
+            img.style.display = "";
+            link.href = src;
+            link.title = "Open the original";
+            meta.textContent = "Last frame " + last.name + " · " + last.at
+                + " · " + Math.round(last.bytes / 1024) + " kB";
+        } else if (meta) {
+            meta.textContent = "No frame yet.";
+            if (img) { img.style.display = "none"; }
+        }
+
         if (strip.dataset.count === String(list.count)) { return; }
         strip.dataset.count = String(list.count);
-        strip.style.display = "flex";
+        // Everything before the last one, which is already shown above.
+        const rest = list.frames.slice(0, -1).slice(-12).reverse();
         strip.innerHTML = "";
-        for (const f of list.frames.slice(-12).reverse()) {
-            const src = "/timelapse/frame/" + encodeURIComponent(list.session)
-                + "/" + encodeURIComponent(f.name);
+        strip.style.display = rest.length ? "flex" : "none";
+        if (earlier) { earlier.style.display = rest.length ? "" : "none"; }
+        for (const f of rest) {
+            const src = frameSrc(list.session, f.name);
             const a = document.createElement("a");
             a.href = src;
             a.target = "_blank";
@@ -1098,10 +1221,15 @@ function initTimelapse() {
                     text += " · " + formatSpan(s.remaining_s) + " left";
                 }
                 if (s.locked) { text += " · exposure locked"; }
-            } else if (s.frames) {
+            } else if (s.frames && s.session_on_card) {
                 text = "stopped · " + s.session + " · frames " + s.frames
                      + (s.stop_reason ? " · " + s.stop_reason : "")
                      + (s.last_error ? " · " + s.last_error : "");
+            } else if (s.frames) {
+                // The state file still remembers the run, but its frames are no
+                // longer on the card - saying "frames 412" about a folder that
+                // is not there is worse than saying nothing.
+                text = "idle · the last run (" + s.session + ") is no longer on the card";
             } else {
                 text = "idle";
             }
@@ -1378,8 +1506,17 @@ window.addEventListener("DOMContentLoaded", initShotNumbers);
 <button type="button" class="power-btn" id="nas_sync">Sync now</button>
 </div>
 <div class="notice ok" id="run_banner" style="display:none;"></div>
+<div id="run_panel" style="display:none;">
+<div class="run-grid" id="run_grid"></div>
+<div class="run-bar"><i id="run_bar_fill"></i></div>
+<div class="run-last">
+<a id="run_last_link" target="_blank" rel="noopener"><img id="run_last_img" alt="Last frame" style="display:none;"></a>
+<div class="help" id="run_last_meta">No frame yet.</div>
+</div>
+<div class="help" id="run_earlier" style="display:none;">Earlier frames</div>
+<div id="run_frames" style="display:none; flex-wrap:wrap; gap:5px; margin-top:4px;"></div>
+</div>
 <div class="help" id="run_stats" style="display:none;"></div>
-<div id="run_frames" style="display:none; flex-wrap:wrap; gap:5px;"></div>
 <div class="help" id="tl_status">idle</div>
 <details>
 <summary>Timelapse settings</summary>
@@ -1747,6 +1884,7 @@ def timelapse_load():
     state.setdefault("frames", 0)
     state.setdefault("next_shot_at", 0.0)
     state.setdefault("last_shot_at", 0.0)
+    state.setdefault("last_shot_seconds", 0.0)
     state.setdefault("session", "")
     state.setdefault("save_raw", False)
     state.setdefault("quality", 93)
@@ -1813,6 +1951,73 @@ def timelapse_remaining():
     return limit - (time.time() - started)
 
 
+def run_plan(state, now=None):
+    """How far along a run is: frames taken, frames planned, frames left.
+
+    A run shoots its first frame at once and then one per interval, for as long
+    as it is inside its limit - so a limit of `max_s` seconds holds
+    ceil(max_s / interval) frames and not one more: the frame that would land
+    exactly on the limit is never shot, because the run stops the moment the
+    time is up. Without a limit the total is not knowable, since the run goes
+    until it is stopped, so the plan says None there rather than inventing a
+    number that would sit on the page looking authoritative.
+
+    Kept apart from the code that reports it because it is the one figure on the
+    page somebody watching a three-day run reads twice - and because a plan that
+    quietly says "4 left" for ever is what nobody notices until it is over.
+    """
+    now = time.time() if now is None else float(now)
+    interval = max(1.0, _number(state.get("interval_s"), 60.0, 1.0, 366 * 86400))
+    limit = _number(state.get("max_s"), 0.0, 0.0, 366 * 86400)
+    taken = max(0, int(_number(state.get("frames"), 0, 0, 1e9)))
+    started = _number(state.get("started_at_epoch"), 0.0, 0.0, 4e9)
+    active = bool(state.get("active"))
+
+    if started <= 0:
+        elapsed = 0.0
+    elif active:
+        elapsed = max(0.0, now - started)
+    else:
+        # A stopped run has no clock of its own, so its length is the distance
+        # from its first frame to its last. Read live, a run that ended
+        # yesterday would still be growing every time the page is opened.
+        elapsed = max(0.0, _number(state.get("last_shot_at"), started,
+                                   0.0, 4e9) - started)
+
+    if limit <= 0:
+        planned = None
+    else:
+        # The interval a run keeps is not the one it was given. A frame costs
+        # time - the lamp lead, the capture, the wait for the preview to let go
+        # of the camera - and the next frame is counted from the end of this one,
+        # so the pace is the interval plus the last frame's cost. On a run of
+        # minutes that is a second or two out of sixty; on a five-second test it
+        # is half the interval, and a plan that ignored it would promise frames
+        # the run never takes.
+        pace = interval + _number(state.get("last_shot_seconds"), 0.0, 0.0, 3600.0)
+        # ceil(limit / pace), written so that an exact multiple - an hour in
+        # one-minute steps - cannot gain a frame from the rounding.
+        planned = int(limit // pace)
+        if planned * pace < limit - 1e-9:
+            planned += 1
+        planned = max(planned, taken)
+    duration = int(round(limit)) if limit > 0 else None
+    return {
+        "taken": taken,
+        "planned": planned,
+        "left": None if planned is None else max(0, planned - taken),
+        "interval_s": interval,
+        "duration_s": duration,
+        "elapsed_s": int(round(elapsed)),
+        "left_s": (max(0, int(round(duration - elapsed)))
+                   if (active and duration is not None) else None),
+        "next_s": (max(0, int(round(_number(state.get("next_shot_at"), 0.0,
+                                         0.0, 4e9) - now)))
+                   if active else None),
+        "done_fraction": (min(1.0, taken / planned) if planned else None),
+    }
+
+
 def timelapse_status():
     with _tl_lock:
         state = dict(_tl_state)
@@ -1833,8 +2038,27 @@ def timelapse_status():
     state["nas_reason"] = nas_reason
     state["nas_pending"] = nas_pending()
     state["free_percent"] = round(disk_free_percent(), 1)
+    state["free_mb"] = disk_free_mb()
     state["min_free_percent"] = _number(
         SETTINGS.get("nas_min_free_percent"), 10.0, 0.0, 50.0)
+
+    # What the page needs to say how far along a run is and what it is costing
+    # in space. The plan is computed from the schedule rather than read off a
+    # counter, so an interrupted-and-resumed run reports the same numbers as one
+    # that never stopped.
+    session = str(state.get("session") or "")
+    state["plan"] = run_plan(state)
+    written = _session_bytes(session, state["plan"]["taken"])
+    state["session_bytes"] = written
+    per_frame = int(written / state["plan"]["taken"]) if state["plan"]["taken"] else 0
+    state["avg_frame_bytes"] = per_frame
+    planned = state["plan"]["planned"]
+    state["estimated_bytes"] = per_frame * planned if (planned and per_frame) else None
+    # A run whose folder has been taken away is not a run with frames: the page
+    # says "stopped, 412 frames" from the state file alone, and would keep saying
+    # it after the frames were gone.
+    state["session_on_card"] = bool(session) and (TIMELAPSE_DIR / session).is_dir()
+    state["shot_with"] = session_record(state)
     return state
 
 
@@ -1854,24 +2078,23 @@ def _new_session_name():
     return name
 
 
-def timelapse_write_meta(session=None):
-    """Record how and when a run was shot, next to its frames.
+def session_record(state=None):
+    """What a run was shot with, in one place.
 
-    The file travels to the NAS with the frames, so a folder opened months later
-    still says which settings produced it and when the run started and stopped.
+    Used twice: it is what goes into session.json, which travels to the NAS with
+    the frames, and it is what the page shows while the run is going. Built once
+    because a second list for the panel is exactly how the page and the archive
+    end up disagreeing about what the camera was set to.
     """
-    with _tl_lock:
-        state = dict(_tl_state)
-    session = session or state.get("session")
-    if not session:
-        return
-    folder = TIMELAPSE_DIR / session
-    if not folder.is_dir():
-        return
+    if state is None:
+        with _tl_lock:
+            state = dict(_tl_state)
     manual = bool(SETTINGS.get("manual_exposure"))
-    lock = state.get("lock") or {}
-    meta = {
-        "session": session,
+    lock = state.get("lock")
+    if not isinstance(lock, dict):
+        lock = {}
+    return {
+        "session": state.get("session", ""),
         "started_at": state.get("started_at", ""),
         "ended_at": state.get("ended_at", ""),
         "frames": int(state.get("frames", 0) or 0),
@@ -1903,6 +2126,24 @@ def timelapse_write_meta(session=None):
         "locked_lamp_brightness": lock.get("lamp_brightness"),
         "locked_gain_limited": bool(lock.get("gain_limited")),
     }
+
+
+def timelapse_write_meta(session=None):
+    """Record how and when a run was shot, next to its frames.
+
+    The file travels to the NAS with the frames, so a folder opened months later
+    still says which settings produced it and when the run started and stopped.
+    """
+    with _tl_lock:
+        state = dict(_tl_state)
+    session = session or state.get("session")
+    if not session:
+        return
+    folder = TIMELAPSE_DIR / session
+    if not folder.is_dir():
+        return
+    meta = session_record(state)
+    meta["session"] = session
     try:
         tmp = folder / (SESSION_META + ".tmp")
         tmp.write_text(json.dumps(meta, indent=2, ensure_ascii=False),
@@ -2098,6 +2339,16 @@ def disk_free_percent():
         return 100.0 * free / total if total else 100.0
     except Exception:
         return 100.0
+
+
+def disk_free_mb():
+    """Free space there in megabytes, for a page that has to say how much room
+    is left rather than what share of the card it is."""
+    try:
+        _, _, free = shutil.disk_usage(BASE_DIR)
+        return int(free / (1024 * 1024))
+    except Exception:
+        return 0
 
 
 def nas_pending():
@@ -2413,6 +2664,7 @@ def timelapse_shot():
         return
 
     ok, err = False, ""
+    shot_began = time.time()
     try:
         sdir.mkdir(parents=True, exist_ok=True)
         with capture_lock:
@@ -2456,6 +2708,10 @@ def timelapse_shot():
         if ok:
             _tl_state["frames"] = index
             _tl_state["last_shot_at"] = now
+            # What a frame cost in time, lamp lead and all. The next one is
+            # scheduled from the end of this, so the pace a run really keeps is
+            # the interval plus this - which is what the panel's plan uses.
+            _tl_state["last_shot_seconds"] = round(now - shot_began, 3)
         _tl_state["next_shot_at"] = now + max(1.0, float(state.get("interval_s", 60) or 60))
         _tl_state["last_error"] = "" if ok else str(err)
     timelapse_save()
@@ -2937,6 +3193,42 @@ def _session_folder(session):
     if not re.fullmatch(r"tl-[0-9]{8}-[0-9]{6}(-[0-9]+)?", session or ""):
         return None
     return TIMELAPSE_DIR / session
+
+
+_SESSION_BYTES = {}      # session -> (frames, bytes): what the folder held then
+
+
+def _session_bytes(session, frames):
+    """How much a run has written, in bytes.
+
+    Summed from the frames on the card rather than counted as they are written,
+    so a folder somebody pruned by hand cannot leave the page reporting a size
+    that is no longer there. Remembered against the frame count, because the
+    total only moves when a frame is added: the page polls this every few
+    seconds and must not walk a folder of ten thousand files each time.
+    """
+    folder = _session_folder(session)
+    if folder is None or not folder.is_dir():
+        _SESSION_BYTES.pop(session, None)
+        return 0
+    cached = _SESSION_BYTES.get(session)
+    if cached is not None and cached[0] == frames:
+        return cached[1]
+    total = 0
+    try:
+        for path in folder.glob("frame_*"):
+            if not FRAME_NAME_RE.match(path.name):
+                continue         # a half-written .tmp frame is not a frame yet
+            try:
+                total += path.stat().st_size
+            except OSError:
+                continue
+    except OSError:
+        return 0
+    if len(_SESSION_BYTES) > 32:     # one entry per session is plenty
+        _SESSION_BYTES.clear()
+    _SESSION_BYTES[session] = (frames, total)
+    return total
 
 
 @app.route("/timelapse/frames")
