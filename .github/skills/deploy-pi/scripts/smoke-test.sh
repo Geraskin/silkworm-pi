@@ -254,20 +254,26 @@ if [[ "${DO_REBOOT}" == "1" ]]; then
         [[ "${session_after}" == "${session}" ]] && pass "the same session was resumed" "${session_after}" \
                                                || fail "the same session was resumed" "${session} -> ${session_after}"
 
+        started_at=$(date +%s)
         sleep $(( INTERVAL + 6 ))
         frames_after=$(status_field frames); frames_after="${frames_after:-0}"
+        elapsed=$(( $(date +%s) - started_at ))
         delta=$(( frames_after - frames_before ))
         (( delta >= 1 )) && pass "frames continued after the reboot" "${frames_before} -> ${frames_after}" \
                          || fail "frames continued after the reboot" "${frames_before} -> ${frames_after}"
 
-        # the app must not replay the shots missed while it was off
+        # The app must not replay the shots it missed while it was off: a catching-up
+        # implementation would fire roughly `missed` frames at once. Allow only what
+        # the elapsed time justifies - the immediate first shot plus one per interval.
+        # A fixed limit would mean different things at different --interval values.
         missed=$(( downtime / INTERVAL ))
-        if (( delta <= 3 )); then
+        allowed=$(( elapsed / INTERVAL + 1 ))
+        if (( delta <= allowed )); then
             pass "no catch-up burst of missed frames" \
-                 "~${missed} shots missed, ${delta} taken"
+                 "~${missed} missed, ${delta} taken in ${elapsed}s (limit ${allowed})"
         else
             fail "no catch-up burst of missed frames" \
-                 "~${missed} shots missed, ${delta} taken"
+                 "~${missed} missed, ${delta} taken in ${elapsed}s (limit ${allowed})"
         fi
 
         gaps_after=$(count_remote "ls -1 ${REMOTE_DIR}/timelapse/${session}/ 2>/dev/null | grep -o 'frame_[0-9]*' | sort -u | sed 's/frame_//' | sort -n | awk 'NR>1 && \$1!=prev+1 {c++} {prev=\$1} END {print c+0}'")
