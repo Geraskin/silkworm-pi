@@ -92,6 +92,25 @@ a NAS that is asleep, slow or unplugged cannot lose a frame:
 Sessions that are already fully archived are not looked at again, so a long run
 with thousands of frames does not re-read the whole archive on every pass.
 
+Sessions that are already fully archived are not looked at again, so a long run
+with thousands of frames does not re-read the whole archive on every pass.
+
+On the NAS each run gets its own folder, grouped by day:
+
+```
+<NAS folder>/
+└── 2026-09-23/
+    └── tl-20260923-094126/
+        ├── frame_000001.jpg
+        ├── frame_000002.jpg
+        └── session.json
+```
+
+`session.json` is the record of how the run was shot: when it started and
+stopped, the interval and frame count, the resolution, rotation, exposure mode,
+denoise and white balance. It is rewritten as the run progresses and re-uploaded
+whenever it changes, so a folder opened months later still explains itself.
+
 ### The card is a cache, not a queue
 
 Local copies are **kept**: the card is a fast cache in front of the NAS, so you can

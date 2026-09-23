@@ -1,6 +1,7 @@
 from flask import Flask, Response, jsonify, render_template_string, request, send_file
 
 import camera as cam
+import hashlib
 import json
 import os
 import shutil
@@ -574,6 +575,7 @@ function initTimelapse() {
     const sync = document.getElementById("nas_sync");
     const info = document.getElementById("tl_status");
     const interval = document.getElementById("tl_interval");
+    const unit = document.getElementById("tl_interval_unit");
 
     async function refresh() {
         try {
@@ -597,7 +599,9 @@ function initTimelapse() {
     }
     if (start) start.addEventListener("click", async () => {
         const body = new FormData();
-        body.append("interval_s", interval ? interval.value : 60);
+        const amount = interval ? (parseFloat(interval.value) || 1) : 60;
+        const factor = unit ? (parseFloat(unit.value) || 1) : 1;
+        body.append("interval_s", String(Math.max(1, Math.round(amount * factor))));
         try { await fetch("/timelapse/start", { method: "POST", body }); } catch (e) {}
         refresh();
     });
@@ -770,10 +774,23 @@ window.addEventListener("DOMContentLoaded", initTimelapse);
 
 <div class="card">
 <h2>Timelapse</h2>
+<div class="topbar-actions" style="justify-content:flex-start;">
+<button type="button" class="power-btn" id="tl_start">Start</button>
+<button type="button" class="power-btn danger" id="tl_stop">Stop</button>
+<button type="button" class="power-btn" id="nas_sync">Sync now</button>
+</div>
+<div class="help" id="tl_status">idle</div>
+<details>
+<summary>Timelapse settings</summary>
 <div class="row">
-<label class="title">Interval, seconds</label>
+<label class="title">Interval</label>
 <input type="number" id="tl_interval" min="1" step="1" value="60">
-<div class="help">One frame every N seconds at full sensor resolution. "Also save RAW" above is honoured.</div>
+<select id="tl_interval_unit">
+<option value="1">seconds</option>
+<option value="60">minutes</option>
+<option value="3600">hours</option>
+</select>
+<div class="help">One frame per interval, at full sensor resolution. "Also save RAW" above is honoured, and a run resumes by itself after a reboot or power cut.</div>
 </div>
 <div class="checks">
 <label><input type="checkbox" name="nas_enabled" form="capture_form" {% if s.nas_enabled %}checked{% endif %}> Copy frames to NAS</label>
@@ -781,19 +798,14 @@ window.addEventListener("DOMContentLoaded", initTimelapse);
 <div class="row">
 <label class="title">NAS folder</label>
 <input type="text" name="nas_dir" form="capture_form" value="{{ s.nas_dir }}" placeholder="/mnt/nas/silkworm" spellcheck="false" autocomplete="off">
-<div class="help">Mount point of the NAS share on the Pi. Frames are always written locally first and copied here afterwards, so an unreachable NAS never loses a frame - the card keeps them until the share is back.</div>
+<div class="help">Mount point of the NAS share on the Pi. Frames are always written locally first and copied here afterwards, so an unreachable NAS never loses a frame - the card keeps them until the share is back. On the NAS each run lands in its own dated folder with a session.json describing how it was shot.</div>
 </div>
 <div class="row">
 <label class="title">Clear the card below, % free</label>
 <input type="number" name="nas_min_free_percent" form="capture_form" min="0" max="50" step="1" value="{{ s.nas_min_free_percent }}">
 <div class="help">Frames stay on the card as long as there is room. Once free space falls below this, the oldest frames that are already safely on the NAS are cleared first. 0 = never clear automatically.</div>
 </div>
-<div class="topbar-actions" style="justify-content:flex-start;">
-<button type="button" class="power-btn" id="tl_start">Start</button>
-<button type="button" class="power-btn danger" id="tl_stop">Stop</button>
-<button type="button" class="power-btn" id="nas_sync">Sync now</button>
-</div>
-<div class="help" id="tl_status">idle</div>
+</details>
 </div>
 
 <div class="card">
@@ -1126,12 +1138,60 @@ def _new_session_name():
     return name
 
 
+def timelapse_write_meta(session=None):
+    """Record how and when a run was shot, next to its frames.
+
+    The file travels to the NAS with the frames, so a folder opened months later
+    still says which settings produced it and when the run started and stopped.
+    """
+    with _tl_lock:
+        state = dict(_tl_state)
+    session = session or state.get("session")
+    if not session:
+        return
+    folder = TIMELAPSE_DIR / session
+    if not folder.is_dir():
+        return
+    manual = bool(SETTINGS.get("manual_exposure"))
+    meta = {
+        "session": session,
+        "started_at": state.get("started_at", ""),
+        "ended_at": state.get("ended_at", ""),
+        "frames": int(state.get("frames", 0) or 0),
+        "interval_s": float(state.get("interval_s", 60) or 60),
+        "resolution": SETTINGS.get("resolution"),
+        "save_raw": bool(state.get("save_raw")),
+        "quality": int(state.get("quality", 93) or 93),
+        "rotation": SETTINGS.get("rotation"),
+        "hflip": SETTINGS.get("hflip"),
+        "vflip": SETTINGS.get("vflip"),
+        "exposure_mode": SETTINGS.get("exposure"),
+        "shutter_us": SETTINGS.get("shutter") if manual else None,
+        "gain": SETTINGS.get("gain") if manual else None,
+        "denoise": SETTINGS.get("denoise"),
+        "awb": SETTINGS.get("awb"),
+        "metering": SETTINGS.get("metering"),
+        "sharpness": SETTINGS.get("sharpness"),
+        "light_on": SETTINGS.get("light_on"),
+        "light_brightness": SETTINGS.get("light_brightness"),
+    }
+    try:
+        tmp = folder / (SESSION_META + ".tmp")
+        tmp.write_text(json.dumps(meta, indent=2, ensure_ascii=False),
+                       encoding="utf-8")
+        os.replace(tmp, folder / SESSION_META)
+    except OSError:
+        pass
+
+
 def timelapse_start(interval_s):
     session = _new_session_name()
     with _tl_lock:
         _tl_state.update({
             "active": True,
             "session": session,
+            "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "ended_at": "",
             "interval_s": max(1.0, float(interval_s)),
             "save_raw": bool(SETTINGS.get("save_raw")),
             "quality": int(SETTINGS.get("quality", 93)),
@@ -1142,13 +1202,16 @@ def timelapse_start(interval_s):
             "last_error": "",
         })
     timelapse_save()
+    timelapse_write_meta(session)
     return timelapse_status()
 
 
 def timelapse_stop():
     with _tl_lock:
         _tl_state["active"] = False
+        _tl_state["ended_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     timelapse_save()
+    timelapse_write_meta()
     return timelapse_status()
 
 
@@ -1166,6 +1229,9 @@ _nas_lock = threading.Lock()
 _nas_next_try = 0.0           # monotonic deadlines: the Pi has no RTC
 _nas_prune_next = 0.0
 _nas_pending = 0              # cached, so the status endpoint stays cheap
+# Session records already on the NAS, keyed by path -> (mtime, size), so a file
+# that changes as the run progresses is re-sent and an unchanged one is not.
+_nas_meta_sent = {}
 # Sessions with nothing left to upload. Only the session being written to can
 # gain frames, and that one is dropped from here on every shot, so a sweep can
 # skip re-listing thousands of already archived files.
@@ -1266,6 +1332,39 @@ def _local_file_count():
     return sum(len(_frame_files(s)) for s in nas_sessions())
 
 
+SESSION_META = "session.json"
+
+
+def nas_session_dir(target, session):
+    """Where a session lives on the NAS: <base>/<YYYY-MM-DD>/<session>.
+
+    Grouped by day, so a camera left running for months still produces a tree a
+    person can walk through instead of one flat directory of thousands of
+    sessions. The date comes from the session name, so the layout is stable and
+    a given frame always lands in the same place.
+    """
+    stamp = session[3:11]                # tl-YYYYMMDD-HHMMSS
+    if len(stamp) == 8 and stamp.isdigit():
+        day = f"{stamp[:4]}-{stamp[4:6]}-{stamp[6:]}"
+    else:
+        day = time.strftime("%Y-%m-%d")
+    return target / day / session
+
+
+def _meta_stamp(path):
+    """A digest of the session record, or None if it is unreadable.
+
+    Content rather than (mtime, size): timestamps can be coarse - tmpfs ticks in
+    milliseconds and an SD card in whole seconds - so a record rewritten twice
+    inside one tick with the same length would look unchanged and never be sent
+    again. The file is only a few hundred bytes, so hashing it is cheap.
+    """
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
 def _nas_listing(session_dir):
     """Names already on the NAS for one session - a single listing call.
 
@@ -1328,23 +1427,36 @@ def nas_flush(force=False):
         uploaded, pending, failed = 0, 0, ""
         try:
             for session in todo:
-                on_nas = _nas_listing(target / session.name)
+                folder = nas_session_dir(target, session.name)
+                on_nas = _nas_listing(folder)
                 left = 0
                 for src in _frame_files(session):
-                    if src.name in on_nas:
+                    stamp = (_meta_stamp(src)
+                             if src.name == SESSION_META else None)
+                    if stamp is not None:
+                        # The session record is rewritten as the run progresses,
+                        # so it is re-sent whenever it changes rather than once.
+                        if _nas_meta_sent.get(str(src)) == stamp:
+                            continue
+                    elif src.name in on_nas:
                         continue
-                    left += 1
-                    pending += 1
+                    counted = stamp is None          # the record is not a frame
+                    if counted:
+                        left += 1
+                        pending += 1
                     if failed:
                         continue
                     try:
-                        _nas_put(src, target / session.name / src.name)
+                        _nas_put(src, folder / src.name)
                     except Exception as exc:      # the NAS went away mid-run
                         failed = str(exc)
                         continue
                     uploaded += 1
-                    left -= 1
-                    pending -= 1
+                    if stamp is not None:
+                        _nas_meta_sent[str(src)] = stamp
+                    if counted:
+                        left -= 1
+                        pending -= 1
                 if not left:
                     _nas_mirrored.add(session.name)
         except Exception as exc:
@@ -1388,7 +1500,7 @@ def nas_prune(force=False):
             if session.name == active:
                 continue            # never clear the session being written to
             for src in _frame_files(session):
-                dst = target / session.name / src.name
+                dst = nas_session_dir(target, session.name) / src.name
                 try:
                     if not dst.is_file() or dst.stat().st_size != src.stat().st_size:
                         continue                      # not safely on the NAS
@@ -1485,6 +1597,7 @@ def timelapse_shot():
         _tl_state["next_shot_at"] = now + max(1.0, float(state.get("interval_s", 60) or 60))
         _tl_state["last_error"] = "" if ok else str(err)
     timelapse_save()
+    timelapse_write_meta(session)
 
 
 def timelapse_tick():
