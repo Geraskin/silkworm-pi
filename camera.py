@@ -74,7 +74,7 @@ _EXPOSURE_ENUM = {"normal": "Normal", "sport": "Short", "long": "Long"}
 # 0=Off, 1=Fast, 2=HighQuality, 3=Minimal.
 _DENOISE_VALUE = {"off": 0, "fast": 1, "high_quality": 2, "minimal": 3}
 
-# Shutter speeds offered in the UI: label -> microseconds.
+# Shutter speeds offered in the UI as shortcuts: label -> microseconds.
 SHUTTER_SPEEDS = [
     ("1/1000 s", 1000),
     ("1/500 s", 2000),
@@ -86,7 +86,20 @@ SHUTTER_SPEEDS = [
     ("1/30 s", 33333),
     ("1/15 s", 66667),
     ("1/10 s", 100000),
+    ("1/8 s", 125000),
+    ("1/4 s", 250000),
+    ("1/2 s", 500000),
+    ("1 s", 1000000),
+    ("2 s", 2000000),
 ]
+
+# The frame period is the ceiling on the exposure: a shutter longer than the
+# frame cannot be granted, and libcamera clamps it without saying so. The camera
+# used to be configured with a plain FrameRate, which pins that period to the
+# frame rate - at 15 fps nothing longer than 1/15 s was ever possible, so every
+# slower entry in the list above was quietly shot at 66 ms. The floor stays where
+# it was, so the preview keeps its rate; only the ceiling moves.
+SHUTTER_MAX_US = 2_000_000
 
 # The Pi's hardware H.264 encoder cannot encode the full 8 MP mode; recording is
 # capped to one of these sizes and the still resolution is restored afterwards.
@@ -273,7 +286,10 @@ class Camera:
             options = {
                 "main": {"size": self._still_size, "format": "RGB888"},
                 "lores": {"size": self.preview_size, "format": "YUV420"},
-                "controls": {"FrameRate": self.fps},
+                "controls": {
+                    "FrameDurationLimits": (int(1_000_000 / max(1, self.fps)),
+                                            SHUTTER_MAX_US),
+                },
             }
             if Transform is not None and (self._hflip or self._vflip):
                 options["transform"] = Transform(

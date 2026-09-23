@@ -5,8 +5,10 @@ from flask import Flask, Response, g, jsonify, render_template_string, request, 
 
 import camera as cam
 import hashlib
+import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -72,6 +74,7 @@ METERING_MODES = cam.METERING_MODES
 EXPOSURE_MODES = cam.EXPOSURE_MODES
 DENOISE_MODES = cam.DENOISE_MODES
 SHUTTER_SPEEDS = cam.SHUTTER_SPEEDS
+SHUTTER_MAX_US = cam.SHUTTER_MAX_US
 
 capture_lock = threading.Lock()
 
@@ -1008,25 +1011,17 @@ function initShotNumbers() {
         }
         const gain = document.querySelector('input[name="gain"]');
         if (gain) { gain.value = last.gain; }
-        // The shutter is a list of fractions, so the closest one to what was
-        // actually used is picked - by ratio, which is the scale exposures live on.
-        const sel = document.querySelector('select[name="shutter"]');
-        if (sel && last.exposure_us) {
-            let best = null, bestDiff = Infinity;
-            for (const opt of sel.options) {
-                const diff = Math.abs(Math.log(parseFloat(opt.value) / last.exposure_us));
-                if (diff < bestDiff) { bestDiff = diff; best = opt.value; }
-            }
-            if (best !== null) { sel.value = best; }
-        }
+        // Free entry, so no list to hunt through: whatever was used is typed back
+        // in as it stands.
+        const shutter = document.querySelector('input[name="shutter"]');
+        if (shutter) { shutter.value = last.exposure_us; }
         const form = document.getElementById("capture_form");
         if (form) {
             try { await fetch("/controls", { method: "POST", body: new FormData(form) }); }
             catch (e) {}
         }
-        const shown = document.querySelector('select[name="shutter"]');
-        if (out && shown) {
-            out.textContent = "held " + formatShutter(parseFloat(shown.value))
+        if (out) {
+            out.textContent = "held " + formatShutter(last.exposure_us)
                 + " · gain " + (gain ? gain.value : "?");
         }
     });
@@ -1044,6 +1039,53 @@ function initTimelapse() {
     const unit = document.getElementById("tl_interval_unit");
     const maxField = document.getElementById("tl_max");
     const maxUnit = document.getElementById("tl_max_unit");
+
+    // While a run is going, what is on screen is the run: what it has fixed, how
+    // far along it is, and the frames it has already taken.
+    async function refreshRun(s) {
+        const strip = document.getElementById("run_frames");
+        const stats = document.getElementById("run_stats");
+        if (!strip || !stats) return;
+        if (!s.active) {
+            strip.style.display = "none";
+            stats.style.display = "none";
+            strip.dataset.count = "";
+            return;
+        }
+        stats.style.display = "";
+        stats.textContent = "frames " + s.frames + " · started " + (s.started_at || "?")
+            + " · every " + formatSpan(s.interval_s)
+            + (typeof s.remaining_s === "number" ? (" · " + formatSpan(s.remaining_s) + " left") : "")
+            + " · " + s.free_percent + "% free"
+            + (s.nas_enabled ? (" · NAS " + (s.nas_ready ? "ready" : "unavailable")
+                + (s.nas_pending ? (", queued " + s.nas_pending) : "")) : "")
+            + (s.last_shot && s.last_shot.exposure_us
+                ? (" · last frame " + formatShutter(s.last_shot.exposure_us)
+                   + " at gain " + s.last_shot.gain) : "");
+        let list;
+        try {
+            list = await (await fetch("/timelapse/frames", { cache: "no-store" })).json();
+        } catch (e) { return; }
+        if (strip.dataset.count === String(list.count)) { return; }
+        strip.dataset.count = String(list.count);
+        strip.style.display = "flex";
+        strip.innerHTML = "";
+        for (const f of list.frames.slice(-12).reverse()) {
+            const src = "/timelapse/frame/" + encodeURIComponent(list.session)
+                + "/" + encodeURIComponent(f.name);
+            const a = document.createElement("a");
+            a.href = src;
+            a.target = "_blank";
+            a.title = f.name + " · " + f.at + " · " + Math.round(f.bytes / 1024) + " kB";
+            const thumb = document.createElement("img");
+            thumb.src = src + "?w=160";
+            thumb.alt = f.name;
+            thumb.style.cssText = "width:96px;height:auto;display:block;"
+                + "border:1px solid var(--line);border-radius:4px;";
+            a.appendChild(thumb);
+            strip.appendChild(a);
+        }
+    }
 
     async function refresh() {
         try {
@@ -1070,6 +1112,7 @@ function initTimelapse() {
             }
             setRunMode(!!s.active, s);
             info.textContent = text;
+            await refreshRun(s);
         } catch (e) {}
     }
     if (start) start.addEventListener("click", async () => {
@@ -1299,13 +1342,15 @@ window.addEventListener("DOMContentLoaded", initShotNumbers);
 
 <div id="manual_block" class="manual-block">
 <div class="row">
-<label class="title">Shutter</label>
-<select name="shutter">
+<label class="title">Shutter, µs</label>
+<input type="number" name="shutter" min="100" max="{{ shutter_max_us }}" step="100"
+       value="{{ s.shutter }}" list="shutter_choices">
+<datalist id="shutter_choices">
 {% for label, us in shutter_speeds %}
-<option value="{{ us }}" {% if s.shutter == us %}selected{% endif %}>{{ label }} ({{ us }} μs)</option>
+<option value="{{ us }}" label="{{ label }}"></option>
 {% endfor %}
-</select>
-<div class="help">Exposure time. 1/100 s = 10 000 μs.</div>
+</datalist>
+<div class="help">Exposure time in microseconds: 1/100 s = 10 000 μs, up to {{ (shutter_max_us / 1000000) | round(1) }} s, which is the ceiling this camera is given - a frame cannot be shorter than the exposure inside it. Free entry on purpose: what "Hold these" copies out of the last frame is rarely one of the usual fractions.</div>
 </div>
 
 <div class="row">
@@ -1333,6 +1378,8 @@ window.addEventListener("DOMContentLoaded", initShotNumbers);
 <button type="button" class="power-btn" id="nas_sync">Sync now</button>
 </div>
 <div class="notice ok" id="run_banner" style="display:none;"></div>
+<div class="help" id="run_stats" style="display:none;"></div>
+<div id="run_frames" style="display:none; flex-wrap:wrap; gap:5px;"></div>
 <div class="help" id="tl_status">idle</div>
 <details>
 <summary>Timelapse settings</summary>
@@ -1602,7 +1649,7 @@ def read_form():
     SETTINGS["denoise"] = denoise if denoise in DENOISE_MODES else "fast"
 
     if SETTINGS["manual_exposure"]:
-        SETTINGS["shutter"] = ival("shutter", SETTINGS["shutter"], 100, 100000)
+        SETTINGS["shutter"] = ival("shutter", SETTINGS["shutter"], 100, SHUTTER_MAX_US)
         SETTINGS["gain"] = fval("gain", SETTINGS["gain"], 1, 16)
 
     preview_before = bool(SETTINGS.get("preview_enabled"))
@@ -1907,7 +1954,7 @@ def _measure_run_lock():
         return {}
     if manual:
         lock["exposure_us"] = int(_number(SETTINGS.get("shutter"), 10000.0,
-                                           100.0, 200_000_000.0))
+                                           100.0, float(SHUTTER_MAX_US)))
         lock["gain"] = round(_number(SETTINGS.get("gain"), 1.0, 1.0, 16.0), 3)
         lock["chosen_by"] = "hand"
     else:
@@ -2493,6 +2540,7 @@ def index():
         resolutions=RESOLUTIONS,
         sliders=SLIDERS,
         shutter_speeds=SHUTTER_SPEEDS,
+        shutter_max_us=SHUTTER_MAX_US,
         awb_modes=AWB_MODES,
         metering_modes=METERING_MODES,
         exposure_modes=EXPOSURE_MODES,
@@ -2872,6 +2920,95 @@ def timelapse_start_route():
 @app.route("/timelapse/stop", methods=["POST"])
 def timelapse_stop_route():
     return jsonify(timelapse_stop())
+
+
+FRAME_NAME_RE = re.compile(r"^frame_[0-9]{6}\.(?:jpg|dng)$")
+FRAME_THUMBS = {}                 # (session, name, width) -> jpeg bytes
+FRAME_THUMB_LIMIT = 48            # one strip is all this cache is ever for
+FRAME_LIST_LIMIT = 60             # how far back the run view looks
+
+
+def _session_folder(session):
+    """The folder for a session name, or None if the name is not one of ours.
+
+    The name comes from a URL, so it is matched against the shape the app makes
+    rather than trusted: without that, a request could walk out of the cache.
+    """
+    if not re.fullmatch(r"tl-[0-9]{8}-[0-9]{6}(-[0-9]+)?", session or ""):
+        return None
+    return TIMELAPSE_DIR / session
+
+
+@app.route("/timelapse/frames")
+def timelapse_frames():
+    """What the current run has captured so far, oldest first."""
+    with _tl_lock:
+        session = str(_tl_state.get("session") or "")
+    folder = _session_folder(session)
+    frames = []
+    if folder is not None and folder.is_dir():
+        try:
+            # Half-written frames carry a .tmp name, so the shape is checked as
+            # well as the prefix - a strip must never show a frame that is not
+            # finished being written.
+            names = [p.name for p in folder.glob("frame_*")
+                     if FRAME_NAME_RE.match(p.name)]
+            for name in sorted(names)[-FRAME_LIST_LIMIT:]:
+                try:
+                    stat = (folder / name).stat()
+                except OSError:
+                    continue
+                frames.append({
+                    "name": name,
+                    "bytes": stat.st_size,
+                    "at": time.strftime("%H:%M:%S", time.localtime(stat.st_mtime)),
+                })
+        except OSError:
+            pass
+    return jsonify(session=session, count=len(frames), frames=frames)
+
+
+@app.route("/timelapse/frame/<session>/<name>")
+def timelapse_frame(session, name):
+    """One frame: the file itself, or a small copy of it for the strip.
+
+    A strip of a dozen 8 MP JPEGs is tens of megabytes over the WiFi, so the
+    small ones are made here - once each, and kept, because the strip is redrawn
+    every time the page polls.
+    """
+    folder = _session_folder(session)
+    if folder is None or not FRAME_NAME_RE.match(name or ""):
+        return jsonify(error="no such frame"), 404
+    path = folder / name
+    if not path.is_file():
+        return jsonify(error="no such frame"), 404
+    try:
+        width = int(request.args.get("w", 0) or 0)
+    except (TypeError, ValueError):
+        width = 0
+    if width <= 0:
+        return send_file(path)
+    width = max(32, min(1024, width))
+    key = (session, name, width)
+    thumb = FRAME_THUMBS.get(key)
+    if thumb is None:
+        try:
+            from PIL import Image
+        except Exception:
+            return jsonify(error="no image support on this host"), 503
+        try:
+            with Image.open(path) as img:
+                img.thumbnail((width, width * 4))
+                buf = io.BytesIO()
+                img.convert("RGB").save(buf, format="JPEG", quality=75)
+            thumb = buf.getvalue()
+        except Exception as exc:
+            return jsonify(error=f"cannot shrink the frame: {exc}"), 500
+        if len(FRAME_THUMBS) >= FRAME_THUMB_LIMIT:
+            FRAME_THUMBS.clear()
+        FRAME_THUMBS[key] = thumb
+    return Response(thumb, mimetype="image/jpeg",
+                    headers={"Cache-Control": "private, max-age=3600"})
 
 
 @app.route("/nas/sync", methods=["POST"])
