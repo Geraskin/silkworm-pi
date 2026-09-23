@@ -363,6 +363,21 @@ button:disabled { opacity:.55; cursor:wait; }
 .toggle-group { display:flex; gap:12px; align-items:center; }
 .image-meta { margin-top:8px; color:var(--muted); font-size:13px; }
 .image-meta a { color:inherit; }
+/* Focus sharpness meter: the number only describes the 1:1 crop, so it sits
+   right next to it and appears with the focus toggle. */
+.focus-meter { margin-top:9px; }
+.focus-head { display:flex; align-items:baseline; gap:10px; font-size:13px; color:var(--muted); }
+.focus-head b { color:var(--text); font-size:15px; font-variant-numeric:tabular-nums; }
+.focus-head button {
+    width:auto; margin-left:auto; padding:3px 9px; font-size:12px; font-weight:600;
+    background:#e6e9ee; color:var(--text); border-radius:6px;
+}
+.focus-bar { position:relative; height:10px; margin:6px 0; border-radius:5px; background:#e6e9ee; overflow:hidden; }
+.focus-fill { height:100%; width:0; background:var(--primary); transition:width .15s linear; }
+.focus-peak { position:absolute; top:0; width:2px; height:100%; background:var(--good); }
+.focus-history { display:flex; align-items:flex-end; gap:1px; height:20px; }
+.focus-history i { flex:1; min-height:1px; background:#c8cdd6; }
+.focus-history i.now { background:var(--primary); }
 details { margin-top:14px; }
 summary { cursor:pointer; font-weight:650; }
 .mono {
@@ -629,11 +644,79 @@ function initTimelapse() {
     setInterval(refresh, 5000);
 }
 
+function initFocusMeter() {
+    const meter = document.getElementById("focus_meter");
+    if (!meter) return;
+    const box = document.querySelector('input[name="focus_mode"]');
+    const scoreOut = document.getElementById("focus_score");
+    const bestOut = document.getElementById("focus_best");
+    const fill = document.getElementById("focus_fill");
+    const mark = document.getElementById("focus_peak_mark");
+    const history = document.getElementById("focus_history");
+    const reset = document.getElementById("focus_reset");
+
+    // The values have no absolute scale, so the bar is drawn against the best
+    // one seen and the peak itself is marked on it.
+    function draw(s) {
+        const score = (s.score === null || s.score === undefined) ? null : s.score;
+        const peak = s.peak || score || 1;
+        const scale = Math.max(peak, score || 0) * 1.05;
+        scoreOut.textContent = score === null ? "—" : score.toFixed(1);
+        bestOut.textContent = score === null ? "best —"
+            : ("best " + peak.toFixed(1)
+               + (s.percent === null || s.percent === undefined ? "" : " · " + s.percent + "% of it"));
+        fill.style.width = (score === null ? 0 : 100 * score / scale) + "%";
+        mark.style.left = (100 * peak / scale) + "%";
+        const hist = s.history || [];
+        while (history.children.length > hist.length) history.removeChild(history.lastChild);
+        while (history.children.length < hist.length) history.appendChild(document.createElement("i"));
+        hist.forEach((v, i) => {
+            const bar = history.children[i];
+            bar.style.height = Math.max(1, 100 * v / scale) + "%";
+            bar.className = (i === hist.length - 1) ? "now" : "";
+        });
+    }
+
+    function clear() {
+        history.innerHTML = "";
+        scoreOut.textContent = "—";
+        bestOut.textContent = "best —";
+        fill.style.width = "0";
+        mark.style.left = "100%";
+    }
+
+    async function refresh() {
+        // Nothing is measured while the focus helper is off, so there is nothing
+        // to read either; the last value would just be stale.
+        if (meter.style.display === "none") return;
+        try {
+            const s = await (await fetch("/focus/score")).json();
+            if (s.ok) draw(s);
+        } catch (e) {}
+    }
+
+    if (reset) reset.addEventListener("click", async () => {
+        clear();
+        try { await fetch("/focus/score", { method: "POST" }); } catch (e) {}
+    });
+
+    if (box) box.addEventListener("change", () => {
+        meter.style.display = box.checked ? "" : "none";
+        clear();
+        if (box.checked) refresh();
+    });
+
+    refresh();
+    setInterval(refresh, 1000);
+}
+
 window.addEventListener("DOMContentLoaded", initLiveSettings);
 window.addEventListener("DOMContentLoaded", initPreviewToggle);
 window.addEventListener("DOMContentLoaded", initCapture);
 window.addEventListener("DOMContentLoaded", initFocusToggle);
+window.addEventListener("DOMContentLoaded", initFocusMeter);
 window.addEventListener("DOMContentLoaded", initTimelapse);
+window.addEventListener("DOMContentLoaded", initWatch);
 </script>
 </head>
 <body>
@@ -839,6 +922,16 @@ window.addEventListener("DOMContentLoaded", initTimelapse);
 <div class="image-meta">
 Live MJPEG from the camera. Keeps running while you take photos.
 Recorder: <b id="rec_state">{{ 'recording' if recording else 'idle' }}</b>
+</div>
+<div class="focus-meter" id="focus_meter"{% if not s.focus_mode %} style="display:none;"{% endif %}>
+<div class="focus-head">
+<span>sharpness <b id="focus_score">—</b></span>
+<span id="focus_best">best —</span>
+<button type="button" id="focus_reset">Reset</button>
+</div>
+<div class="focus-bar"><div class="focus-fill" id="focus_fill"></div><div class="focus-peak" id="focus_peak_mark" style="left:100%;"></div></div>
+<div class="focus-history" id="focus_history"></div>
+<div class="help">Detail in the centre of the 1:1 crop (the middle 640x480 at most, so a wider crop stays fast), measured before JPEG compression: average difference between neighbouring pixels over average brightness. There is no absolute scale — a soft subject reads in the low tens, a flat frame reads 0 — so focus by making it as large as possible and by keeping the bar at the green peak mark; press Reset before a new attempt. Only the focus knob should move it much: dimming the lamp or changing the exposure moves it a little too, and there is no light in the dark to focus on, so a black frame reads low rather than impressive. Focus mode keeps the denoiser off on purpose, so sensor noise sets a floor in a dim scene — there the peak and the trend say more than the number.</div>
 </div>
 </section>
 
@@ -1901,11 +1994,14 @@ def focus_check():
     except Exception:
         count = 1
     times, shots, ok = [], 0, True
+    scores = []
     for _ in range(count):
         camera.preview_blocked_until = time.monotonic() + FOCUS_BLOCK_S
         step = time.time()
-        data = camera.focus_jpeg(crop)
+        data, score = camera.focus_frame(crop)
         times.append(int((time.time() - step) * 1000))
+        if score is not None:
+            scores.append(score)
         if not data:
             ok = False
             break

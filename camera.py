@@ -97,6 +97,91 @@ VIDEO_SIZES = [(1920, 1080), (1640, 1232), (640, 480)]
 # colour artifacts that are visible at this small size.
 PREVIEW_JPEG_QUALITY = 92
 
+# Focus sharpness meter. The focus helper shows a 1:1 crop, so the number has to
+# describe exactly those pixels and is measured on the crop itself. Absolute units
+# mean nothing here: the value only says "sharper than a moment ago", which is what
+# focusing by hand needs. Everything runs through PIL's C loops - no numpy.
+#
+# The one pixel of smoothing before measuring is a trade-off. None at all and the
+# sensor noise reads as detail, because focus mode keeps the denoiser off on
+# purpose. Too much and the 2-4 pixel detail that 1:1 focusing exists to judge is
+# gone. A 3x3 binomial (1 2 1 / 2 4 2 / 1 2 1, divided by 16) beats both
+# alternatives that were measured on the Pi: a Gaussian of the same strength costs
+# a third more time and washes out more of that fine detail, and a box blur of the
+# same width nulls out texture at its own period - three pixels - so a perfectly
+# sharp subject could make the meter dip. The binomial's only zero is at the
+# Nyquist limit, where there is nothing to resolve anyway.
+FOCUS_SCORE_KERNEL = (ImageFilter.Kernel((3, 3), (1, 2, 1, 2, 4, 2, 1, 2, 1),
+                                         scale=16) if HAVE_PIL else None)
+
+# How much of the crop the meter looks at. A 1280x960 crop costs four times as
+# much to measure as the frame itself on a Pi 3 (186 ms against 145 ms), which
+# would halve the focus frame rate for no extra information - the centre is where
+# 1:1 focusing happens anyway. At this size the cost stays around 45 ms, and the
+# number always describes the middle of what is on screen.
+FOCUS_SCORE_WINDOW = (640, 480)
+
+# Floor for the brightness the gradient is divided by. Dividing is what keeps a
+# dimmer frame (a lamp turned down, a cloud) from reading as a focus change, but
+# the divisor must not go to zero: a covered lens measured 218 - the best number
+# the meter has ever shown - on a frame whose mean brightness was 1.4 out of 255,
+# because the ratio of nothing over almost nothing is huge. Holding the divisor
+# at this floor keeps normal scenes exactly as they were and makes a dark frame
+# read low instead of superb.
+FOCUS_SCORE_DARK = 32.0
+
+
+def score_window(image, limit=FOCUS_SCORE_WINDOW):
+    """The part of a focus crop the meter measures: its centre, up to `limit`."""
+    if image.width <= limit[0] and image.height <= limit[1]:
+        return image
+    x = max(0, (image.width - limit[0]) // 2)
+    y = max(0, (image.height - limit[1]) // 2)
+    return image.crop((x, y,
+                       min(image.width, x + limit[0]),
+                       min(image.height, y + limit[1])))
+
+
+def sharpness_score(image) -> float:
+    """Relative sharpness of a PIL image: mean gradient over mean brightness.
+
+    Detail is the average absolute difference between neighbouring pixels,
+    horizontally and vertically, so the number does not depend on which way the
+    edges in the frame happen to run.
+
+    Two corrections make it usable while focusing by hand:
+
+    * the image is smoothed first (see FOCUS_SCORE_KERNEL). Focus mode turns the
+      ISP denoiser off on purpose, so a 1:1 crop carries real sensor noise, and
+      without the blur that noise alone reads as detail - it would call a dark,
+      soft frame sharp;
+    * the gradient is divided by the mean brightness. In a dim scene both the
+      signal and the noise shrink, and a raw gradient would follow the exposure
+      instead of the focus. The divisor never drops below FOCUS_SCORE_DARK, so a
+      frame with no light in it cannot score high by dividing by ~zero.
+
+    The result is relative, not a physical unit: compare it with the same scene a
+    moment earlier (the UI keeps a peak for that), never between two subjects.
+    Returns 0.0 for an image too small to measure.
+    """
+    if not HAVE_PIL or FOCUS_SCORE_KERNEL is None or image is None:
+        return 0.0
+    grey = image.convert("L")
+    if grey.width < 3 or grey.height < 3:
+        return 0.0
+    grey = grey.filter(FOCUS_SCORE_KERNEL)
+    w, h = grey.size
+    right = ImageChops.difference(grey.crop((1, 0, w, h)),
+                                 grey.crop((0, 0, w - 1, h)))
+    down = ImageChops.difference(grey.crop((0, 1, w, h)),
+                                 grey.crop((0, 0, w, h - 1)))
+    # Sums, not the mean of an averaged image: on a Pi 3 that is one full-image
+    # operation less per frame, and the focus stream is measured frame by frame.
+    total = ImageStat.Stat(right).sum[0] + ImageStat.Stat(down).sum[0]
+    brightness = max(FOCUS_SCORE_DARK, ImageStat.Stat(grey).mean[0])
+    pixels = float((w - 1) * (h - 1))
+    return round(1000.0 * total / (2.0 * pixels) / brightness, 1)
+
 
 class _Stream(io.BufferedIOBase):
     """File-like sink that keeps the most recent MJPEG frame."""
@@ -454,34 +539,52 @@ class Camera:
             request.release()
 
     # ------------------------------------------------------------------ focus
-    def focus_jpeg(self, crop=(640, 480), quality=90):
-        """Full-resolution frame, 1:1 centre crop, returned as JPEG bytes.
+    def focus_frame(self, crop=(640, 480), quality=90):
+        """Full-resolution frame, 1:1 centre crop, as (JPEG bytes, sharpness).
 
         No scaling: one sensor pixel maps to one pixel of the result, so focus
-        can be judged objectively. Returns None on failure.
+        can be judged objectively. The sharpness is measured on the centre of
+        those very pixels (see score_window), before JPEG compression touches
+        them. Returns (None, None) on failure.
         """
         if not AVAILABLE or not self._running or not HAVE_PIL:
-            return None
+            return None, None
         try:
             # Same lock as capture(): the still path and the preview encoder must
             # not touch the camera at the same time, and without this the capture
-            # can block for ever instead of failing.
+            # can block for ever instead of failing. Everything below is inside
+            # the try as well: a frame caught mid-restart can come back with a
+            # shape nobody expects, and that must be a retry rather than an
+            # exception - the generator that feeds the browser would die with it
+            # and the picture would go black for good.
             with self._lock:
                 self._wait_for_encoder()
                 array = self._main_array()
+            if getattr(array, "ndim", 0) != 3:
+                raise ValueError(
+                    f"unexpected frame shape {getattr(array, 'shape', None)}")
+            h, w = array.shape[:2]
+            cw = max(16, min(int(crop[0]), w))
+            ch = max(16, min(int(crop[1]), h))
+            x = (w - cw) // 2
+            y = (h - ch) // 2
+            region = array[y:y + ch, x:x + cw][..., ::-1].copy()  # BGR -> RGB
+            image = Image.fromarray(region)
+            try:
+                # The meter must never break the focus view: no score beats no
+                # picture.
+                score = sharpness_score(score_window(image))
+            except Exception as exc:
+                self.last_error = f"sharpness_score: {type(exc).__name__}: {exc}"
+                score = None
+            buf = io.BytesIO()
+            image.save(buf, format="JPEG", quality=int(quality))
+            data = buf.getvalue()
         except Exception as exc:
             self.last_error = f"{type(exc).__name__}: {exc}"
-            return None
+            return None, None
         self.last_error = ""
-        h, w = array.shape[:2]
-        cw = max(16, min(int(crop[0]), w))
-        ch = max(16, min(int(crop[1]), h))
-        x = (w - cw) // 2
-        y = (h - ch) // 2
-        region = array[y:y + ch, x:x + cw][..., ::-1].copy()  # BGR -> RGB
-        buf = io.BytesIO()
-        Image.fromarray(region).save(buf, format="JPEG", quality=int(quality))
-        return buf.getvalue()
+        return data, score
 
     # ------------------------------------------------------------------ video
     def _video_size(self):
