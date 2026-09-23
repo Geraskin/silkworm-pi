@@ -75,7 +75,9 @@ fail() { RESULTS+=("FAIL|$1|${2:-}"); }
 skip() { RESULTS+=("SKIP|$1|${2:-}"); }
 
 remote() { ssh "${SSH_OPTS[@]}" "${SSH_TARGET}" "$@"; }
-api()    { curl -fsS --max-time 15 "${BASE}$1"; }
+api()    { curl -fsS --max-time 15 "${BASE}$1" "${@:2}"; }
+# grep -c exits 1 when it counts nothing, so count without a fallback of our own
+count_remote() { remote "$1" 2>/dev/null | head -1 | tr -dc '0-9'; }
 field()  { python3 -c 'import json,sys
 try:
     print(json.load(sys.stdin).get(sys.argv[1], ""))
@@ -151,7 +153,8 @@ fi
 say "    last_error: '$(status_field last_error)'"
 
 # the frames on the card must match what the state file claims
-local_jpg=$(remote "ls -1 ${REMOTE_DIR}/timelapse/${session}/ 2>/dev/null | grep -c 'frame_.*\.jpg$'" 2>/dev/null || echo 0)
+local_jpg=$(count_remote "ls -1 ${REMOTE_DIR}/timelapse/${session}/ 2>/dev/null | grep -c 'frame_.*\.jpg$' || true")
+local_jpg=${local_jpg:-0}
 if (( local_jpg == frames )); then
     pass "frame files on the card match the counter" "${local_jpg} jpg"
 else
@@ -159,19 +162,25 @@ else
 fi
 
 # numbering must be contiguous, so a resume can never duplicate or skip
-gaps=$(remote "ls -1 ${REMOTE_DIR}/timelapse/${session}/ 2>/dev/null | grep -o 'frame_[0-9]*' | sed 's/frame_//' | sort -n | awk 'NR>1 && \$1!=prev+1 {c++} {prev=\$1} END {print c+0}'" 2>/dev/null || echo '?')
-[[ "${gaps}" == "0" ]] && pass "frame numbering is contiguous" \
-                       || fail "frame numbering is contiguous" "${gaps} gap(s)"
+if (( frames > 0 )); then
+    gaps=$(count_remote "ls -1 ${REMOTE_DIR}/timelapse/${session}/ 2>/dev/null | grep -o 'frame_[0-9]*' | sort -u | sed 's/frame_//' | sort -n | awk 'NR>1 && \$1!=prev+1 {c++} {prev=\$1} END {print c+0}'")
+    gaps=${gaps:-0}
+    [[ "${gaps}" == "0" ]] && pass "frame numbering is contiguous" \
+                           || fail "frame numbering is contiguous" "${gaps} gap(s)"
+else
+    skip "frame numbering is contiguous" "no frames were taken"
+fi
 
-if remote "python3 -c 'import json;json.load(open(\"${REMOTE_DIR}/timelapse/state.json\"))'" >/dev/null 2>&1; then
+if remote "python3 -c 'import json,os;json.load(open(os.path.expanduser(\"${REMOTE_DIR}/timelapse/state.json\")))'" >/dev/null 2>&1; then
     pass "state.json is valid JSON on the Pi"
 else
     fail "state.json is valid JSON on the Pi"
 fi
 
-raw_enabled=$(remote "python3 -c 'import json;print(json.load(open(\"${REMOTE_DIR}/settings.json\")).get(\"save_raw\"))'" 2>/dev/null || echo "?")
+raw_enabled=$(remote "python3 -c 'import json,os;print(json.load(open(os.path.expanduser(\"${REMOTE_DIR}/settings.json\"))).get(\"save_raw\"))'" 2>/dev/null || echo "?")
 if [[ "${raw_enabled}" == "True" ]]; then
-    local_dng=$(remote "ls -1 ${REMOTE_DIR}/timelapse/${session}/ 2>/dev/null | grep -c 'frame_.*\.dng$'" 2>/dev/null || echo 0)
+    local_dng=$(count_remote "ls -1 ${REMOTE_DIR}/timelapse/${session}/ 2>/dev/null | grep -c 'frame_.*\.dng$' || true")
+    local_dng=${local_dng:-0}
     (( local_dng == frames )) && pass "RAW frames written for every frame" "${local_dng} dng" \
                                || fail "RAW frames written for every frame" "${local_dng} dng for ${frames} frames"
 else
@@ -182,8 +191,9 @@ fi
 if [[ "${nas_enabled}" == "True" && "${nas_ready}" == "True" ]]; then
     say "==> NAS is mounted; waiting for the sweep to catch up"
     sleep 12
-    nas_dir=$(remote "python3 -c 'import json;print(json.load(open(\"${REMOTE_DIR}/settings.json\")).get(\"nas_dir\",\"\"))'" 2>/dev/null || echo "")
-    nas_jpg=$(remote "ls -1 '${nas_dir}'/${session}/ 2>/dev/null | grep -c 'frame_.*\.jpg$'" 2>/dev/null || echo 0)
+    nas_dir=$(remote "python3 -c 'import json,os;print(json.load(open(os.path.expanduser(\"${REMOTE_DIR}/settings.json\"))).get(\"nas_dir\",\"\"))'" 2>/dev/null || echo "")
+    nas_jpg=$(count_remote "ls -1 '${nas_dir}'/${session}/ 2>/dev/null | grep -c 'frame_.*\.jpg$' || true")
+    nas_jpg=${nas_jpg:-0}
     if (( nas_jpg >= frames )); then
         pass "frames reached the NAS" "${nas_jpg} jpg in ${nas_dir}/${session}"
     else
@@ -197,7 +207,7 @@ if [[ "${nas_enabled}" == "True" && "${nas_ready}" == "True" ]]; then
                               || fail "local copies are kept, not moved" "${local_jpg} of ${frames}"
 elif [[ "${nas_enabled}" == "True" ]]; then
     say "==> NAS is enabled but not usable (${nas_reason}); checking that nothing is lost"
-    nas_dir=$(remote "python3 -c 'import json;print(json.load(open(\"${REMOTE_DIR}/settings.json\")).get(\"nas_dir\",\"\"))'" 2>/dev/null || echo "")
+    nas_dir=$(remote "python3 -c 'import json,os;print(json.load(open(os.path.expanduser(\"${REMOTE_DIR}/settings.json\"))).get(\"nas_dir\",\"\"))'" 2>/dev/null || echo "")
     say "    configured folder: ${nas_dir:-none}"
     mount_info=$(remote "findmnt -no TARGET,FSTYPE --target '${nas_dir:-/}'" 2>/dev/null || true)
     say "    mount check on the Pi: ${mount_info:-not a mount point}"
@@ -260,7 +270,8 @@ if [[ "${DO_REBOOT}" == "1" ]]; then
                  "~${missed} shots missed, ${delta} taken"
         fi
 
-        gaps_after=$(remote "ls -1 ${REMOTE_DIR}/timelapse/${session}/ 2>/dev/null | grep -o 'frame_[0-9]*' | sed 's/frame_//' | sort -n | awk 'NR>1 && \$1!=prev+1 {c++} {prev=\$1} END {print c+0}'" 2>/dev/null || echo '?')
+        gaps_after=$(count_remote "ls -1 ${REMOTE_DIR}/timelapse/${session}/ 2>/dev/null | grep -o 'frame_[0-9]*' | sort -u | sed 's/frame_//' | sort -n | awk 'NR>1 && \$1!=prev+1 {c++} {prev=\$1} END {print c+0}'")
+        gaps_after=${gaps_after:-0}
         [[ "${gaps_after}" == "0" ]] && pass "numbering survived the reboot" \
                                      || fail "numbering survived the reboot" "${gaps_after} gap(s)"
     fi
@@ -272,7 +283,7 @@ fi
 say "==> Checking the focus stream"
 api "/timelapse/stop" -X POST >/dev/null 2>&1 || true
 sleep 2
-focus_out=/tmp/focus-check.$$
+focus_out=$(mktemp)
 curl -s --max-time 8 -o "${focus_out}" "${BASE}/focus" >/dev/null 2>&1 || true
 focus_bytes=$(wc -c < "${focus_out}" 2>/dev/null || echo 0)
 focus_frames=$(grep -c -- '--frame' "${focus_out}" 2>/dev/null || echo 0)
