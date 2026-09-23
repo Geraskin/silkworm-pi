@@ -192,12 +192,15 @@ if [[ "${nas_enabled}" == "True" && "${nas_ready}" == "True" ]]; then
     say "==> NAS is mounted; waiting for the sweep to catch up"
     sleep 12
     nas_dir=$(remote "python3 -c 'import json,os;print(json.load(open(os.path.expanduser(\"${REMOTE_DIR}/settings.json\"))).get(\"nas_dir\",\"\"))'" 2>/dev/null || echo "")
-    nas_jpg=$(count_remote "ls -1 '${nas_dir}'/${session}/ 2>/dev/null | grep -c 'frame_.*\.jpg$' || true")
+    # A run lands in <folder>/<YYYY-MM-DD>/<session>/ - the day comes from the
+    # session name, so the check has to look there and not in the folder root.
+    session_day=$(printf '%s' "${session}" | sed -n 's/^tl-\([0-9]\{4\}\)\([0-9]\{2\}\)\([0-9]\{2\}\)-.*/\1-\2-\3/p')
+    nas_jpg=$(count_remote "ls -1 '${nas_dir}'/${session_day}/${session}/ 2>/dev/null | grep -c 'frame_.*\.jpg$' || true")
     nas_jpg=${nas_jpg:-0}
     if (( nas_jpg >= frames )); then
-        pass "frames reached the NAS" "${nas_jpg} jpg in ${nas_dir}/${session}"
+        pass "frames reached the NAS" "${nas_jpg} jpg in ${nas_dir}/${session_day}/${session}"
     else
-        fail "frames reached the NAS" "${nas_jpg} of ${frames} in ${nas_dir}/${session}"
+        fail "frames reached the NAS" "${nas_jpg} of ${frames} in ${nas_dir}/${session_day}/${session}"
     fi
     pending=$(status_field nas_pending); pending="${pending:-0}"
     (( pending == 0 )) && pass "nothing is left queued" \
@@ -299,6 +302,19 @@ if (( focus_bytes > 2000 )) && (( focus_frames >= 1 )); then
 else
     fail "the focus stream produces frames" "${focus_bytes} bytes, ${focus_frames} frame marker(s)"
 fi
+
+# The sharpness meter is fed by the stream that just ran, and reading it must not
+# capture anything itself. The value is relative, so only its presence is checked
+# here - a lens cap in front of the camera would legitimately read 0.
+score_json=$(api "/focus/score" 2>/dev/null || true)
+score_value=$(printf '%s' "${score_json}" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("score"))' 2>/dev/null || true)
+score_frames=$(printf '%s' "${score_json}" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("frames"))' 2>/dev/null || true)
+if [[ "${score_value}" =~ ^[0-9]+(\.[0-9]+)?$ ]] && (( ${score_frames:-0} >= 1 )); then
+    pass "the focus stream measures sharpness" "score ${score_value} over ${score_frames} frame(s)"
+else
+    fail "the focus stream measures sharpness" "${score_json}"
+fi
+api "/focus/score" -X POST >/dev/null 2>&1 || true   # leave no peak behind
 
 # ---------------------------------------------------------------- restore
 if [[ "${KEEP_RUNNING}" == "0" ]]; then

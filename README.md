@@ -145,6 +145,36 @@ The crop size is selectable: `320x240` (strongest magnification), `640x480` (the
 default) and `1280x960` (more of the frame). Magnifying beyond 1:1 adds nothing but
 interpolation, so the app does not offer it.
 
+### The sharpness meter
+
+Under the picture sits a number that says how much detail the crop actually
+contains, so focusing is not a matter of squinting: the average difference between
+neighbouring pixels, divided by the average brightness, measured before JPEG
+compression touches the frame. Turning the knob is the only thing that should move
+it much — the division by brightness is there because a dimmer lamp or a cloud
+would otherwise read as a focus change.
+
+The value has no absolute scale, so the meter keeps **the best one seen** (a peak
+mark on the bar) and a strip of the recent samples; focus by making it as large as
+possible and keeping the bar at the peak, then press *Reset* for the next attempt.
+A flat grey frame reads 0 and a soft subject reads in the low tens — the number is
+about the same scene a moment earlier, not about comparing two setups.
+
+It measures the **centre** of the crop, at most 640x480 pixels of it, so selecting
+the wide `1280x960` view does not quadruple the work per frame and halve the frame
+rate. Sensor noise sets the floor, and focus mode deliberately leaves the ISP
+denoiser off so that the grain in a dark scene is real. Only a single pixel of
+smoothing is applied before measuring — the smallest 3x3 binomial, enough to stop
+grain from reading as detail, small enough to keep the 2-4 pixel detail that 1:1
+focusing is for. A box blur of the same width was rejected: it nulls out texture at
+its own period, so perfectly sharp three-pixel detail would make the meter dip.
+
+Dimming the lamp or losing the sun must not look like losing focus, so the detail
+is divided by the brightness of the frame. That divisor stops at a floor: a covered
+lens scored 218 — the best number the meter had ever shown — before it did, because
+nothing divided by almost nothing is huge. There is nothing to focus on in the
+dark, and now the number says so.
+
 ## Live preview and stills
 
 - Hardware-accelerated **MJPEG preview** with a configurable bitrate. It keeps

@@ -1,4 +1,7 @@
-from flask import Flask, Response, jsonify, render_template_string, request, send_file
+import uuid
+from contextlib import contextmanager
+
+from flask import Flask, Response, g, jsonify, render_template_string, request, send_file
 
 import camera as cam
 import hashlib
@@ -49,6 +52,9 @@ DEFAULT_SETTINGS = {
     "light_on": False,
     "light_brightness": 0.5,
     "light_freq": 1000,
+    "light_flash": False,
+    "light_flash_brightness": 1.0,
+    "light_flash_lead_s": 3.0,
 }
 
 RESOLUTIONS = {
@@ -120,24 +126,208 @@ def effective_controls():
     applying the neutral settings only once when the stream starts would let any
     settings POST in the meantime quietly switch denoise and sharpening back on,
     and the focus view would stop showing real pixels.
+
+    A running timelapse adds its own lock, so every frame of it is shot with the
+    same exposure and white balance rather than re-decided frame by frame.
     """
     s = dict(SETTINGS)
     if s.get("focus_mode"):
         s["denoise"] = "off"
         s["sharpness"] = 1.0
+    lock = timelapse_lock()
+    if lock:
+        s["locked"] = lock
     return s
 
 
-def camera_start():
-    """Start the camera once and push the saved controls to it."""
+# ------------------------------------------------------------ who is in charge
+# Two things are worth guarding against here.
+#
+# One camera has one owner. Two browsers driving it at once race for the device:
+# the encoder, the still capture and the focus helper all want it to themselves,
+# and what comes out is a stream that stops or a capture that blocks. So the
+# first page to ask holds a lease and the rest only watch.
+#
+# And a browser that is gone must not keep the camera alive. A closed tab or a
+# sleeping laptop leaves a connection that never says goodbye, and a stream can
+# keep writing into it for a long time without noticing - which is how a focus
+# stream held the preview off indefinitely. So the page says "still here" on a
+# heartbeat instead, and the camera is released once nothing wants it.
+PAGE_COOKIE = "camweb_page"
+WATCHER_TIMEOUT_S = 15.0      # no heartbeat for this long and that page is gone
+CAMERA_IDLE_S = 20.0         # keep the camera this long after its last use
+_watch_lock = threading.Lock()
+_watchers = {}               # page id -> monotonic time of its last heartbeat
+_controller = ""             # the page allowed to drive the camera
+_camera_wanted_at = 0.0      # monotonic time the camera was last wanted
+
+
+def _page_id():
+    """This page's id, minted once and then carried in a cookie.
+
+    A cookie rather than a query argument because the preview is a plain <img>:
+    the browser sends the cookie with it, so an image request can be tied to the
+    page that asked for it without any JavaScript involved.
+    """
+    ident = request.cookies.get(PAGE_COOKIE, "")
+    if not ident:
+        ident = uuid.uuid4().hex[:12]
+        g.new_page_id = ident
+    return ident
+
+
+def _local_request():
+    """Something on the Pi itself, not a second browser.
+
+    The smoke test and any maintenance script talk to the app over loopback;
+    holding a lease has no meaning for them.
+    """
+    return request.remote_addr in ("127.0.0.1", "::1", None)
+
+
+def _drop_stale(now):
+    """Forget the pages that stopped saying they are there. Caller holds the lock."""
+    for ident, seen in list(_watchers.items()):
+        if now - seen > WATCHER_TIMEOUT_S:
+            del _watchers[ident]
+
+
+def watch_beat(ident, take=False):
+    """Record a sign of life; return whether this page now holds the lease.
+
+    The lease is handed to whoever is asking when it is free, and taken back
+    from a page that stopped asking long enough ago. `take` overrides that, which
+    is the way out of a page that is stuck rather than gone.
+    """
+    global _controller
+    now = time.monotonic()
+    with _watch_lock:
+        _drop_stale(now)
+        if ident:
+            _watchers[ident] = now
+        if take and ident:
+            _controller = ident
+        elif _controller not in _watchers:
+            _controller = ident or next(iter(_watchers), "")
+        return bool(ident) and ident == _controller
+
+
+def anyone_watching():
+    """Whether any page has said it is there recently enough."""
+    with _watch_lock:
+        _drop_stale(time.monotonic())
+        return bool(_watchers)
+
+
+def stream_watcher():
+    """A liveness test for one stream, decided while the request is in hand.
+
+    A browser gets a stream that ends as soon as it stops saying it is there. A
+    script on the Pi is not a browser and has no heartbeat to send, so it is
+    taken at its word for as long as it holds the connection - which is what the
+    smoke test relies on. The answer is worked out here rather than inside the
+    generator, because by the time a response is being streamed the request
+    context it was built in may be gone.
+    """
+    if _local_request():
+        return lambda: True
+    return anyone_watching
+
+
+def in_charge():
+    """Whether the page behind this request owns the camera."""
+    if _local_request():
+        return True
+    ident = request.cookies.get(PAGE_COOKIE, "")
+    with _watch_lock:
+        _drop_stale(time.monotonic())
+        return bool(ident) and ident == _controller
+
+
+def camera_keep():
+    """Note that the camera is wanted right now."""
+    global _camera_wanted_at
+    _camera_wanted_at = time.monotonic()
+
+
+def camera_needed():
+    """Whether anything still wants the camera at this instant.
+
+    Only a watched preview counts. A run wants it for the length of one frame and
+    takes it itself, so between the frames of a run that lasts days the device
+    stays closed.
+    """
+    if not anyone_watching():
+        return False
+    return bool(SETTINGS.get("preview_enabled", True)
+                or SETTINGS.get("focus_mode"))
+
+
+def focus_mode_off(reason=""):
+    """Leave focus mode, so its ISP overrides cannot leak into anything else.
+
+    Focus mode is a mode, not a setting: it exists so that the focus view shows
+    real pixels with the denoiser and the sharpening out of the way, and it has
+    no business still being on when a run is shooting its frames. Left on, a
+    session records `denoise: fast` while every frame of it was taken with the
+    denoiser off.
+    """
+    if not SETTINGS.get("focus_mode"):
+        return False
+    SETTINGS["focus_mode"] = False
+    save_settings()
+    camera.preview_blocked_until = 0.0
+    app.logger.info("focus mode off: %s", reason or "nobody is looking")
+    camera_ensure()
+    return True
+
+
+def camera_ensure():
+    """Have the camera up with the settings it should have, starting it if needed.
+
+    Every path that touches the camera goes through here. The camera is no longer
+    kept running: it is started when something wants it and released again when
+    nothing does, so a camera that had gone idle has to be handed the settings
+    again - libcamera would otherwise run it at its own defaults.
+    """
     if not cam.AVAILABLE:
-        return
-    camera.start(
-        camera_size(),
-        preview_size=preview_size(),
-        **orientation_flags(),
-    )
+        return False
+    camera_keep()
+    if not camera.running:
+        camera.start(
+            camera_size(),
+            preview_size=preview_size(),
+            **orientation_flags(),
+        )
+    camera.set_preview_enabled(SETTINGS.get("preview_enabled", True))
     camera.apply_controls(effective_controls())
+    return camera.running
+
+
+def camera_idle_check():
+    """Release the camera once nothing has wanted it for a while.
+
+    Called from the background worker. Without it the camera would stay open from
+    the moment the service started, drawing power and warming the board for a
+    browser that closed its tab hours ago.
+    """
+    if not cam.AVAILABLE or not camera.running:
+        return
+    if camera.recording:
+        camera_keep()
+        return
+    if camera_needed():
+        camera_keep()
+        return
+    if time.monotonic() - _camera_wanted_at < CAMERA_IDLE_S:
+        return
+    with capture_lock:            # never tear down in the middle of a capture
+        if camera_needed() or camera.recording:
+            return
+        focus_mode_off("nothing is watching")
+        camera.stop()
+        app.logger.info("camera released: nothing has wanted it for %ds",
+                        int(CAMERA_IDLE_S))
 
 
 def load_settings():
@@ -243,18 +433,29 @@ except Exception:
 _LIGHT_STATE = {"on": None, "duty_pct": None, "freq": None}
 
 
-def apply_light():
+def apply_light(on=None, brightness=None):
     """Apply the lamp state, skipping redundant PWM writes.
 
     Every PWMOutputDevice.value write re-arms the (software) PWM in lgpio, which
     can cause a brief visible flicker, so only write when the 1 % duty step or
     the on/off state actually changes.
+
+    `on` and `brightness` override the stored settings for this one call, which
+    is how a shot borrows the lamp for its own exposure without disturbing what
+    the user set.
     """
     if not GPIO_AVAILABLE:
         return
-    on = bool(SETTINGS.get("light_on"))
-    duty_pct = max(
-        0, min(100, int(round(SETTINGS.get("light_brightness", 0.0) * 100))))
+    if on is None:
+        on = bool(SETTINGS.get("light_on"))
+    if brightness is None:
+        brightness = SETTINGS.get("light_brightness", 0.0)
+    on = bool(on)
+    try:
+        brightness = max(0.0, min(1.0, float(brightness)))
+    except (TypeError, ValueError):
+        brightness = 0.0
+    duty_pct = max(0, min(100, int(round(brightness * 100))))
     try:
         freq = max(1, min(10000, int(SETTINGS.get("light_freq", 1000))))
     except Exception:
@@ -283,6 +484,61 @@ def apply_light():
 
 
 apply_light()
+
+
+def _lamp_number(value, default, lo, hi):
+    """A lamp setting as a clamped float, whatever it happens to hold."""
+    try:
+        return max(lo, min(hi, float(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+@contextmanager
+def lamp_lit():
+    """The lamp on at the flash brightness for as long as the block runs.
+
+    Does nothing at all when the flash is off, so callers can wrap their work
+    unconditionally and find out from the value whether it is lit.
+    """
+    if not GPIO_AVAILABLE or not SETTINGS.get("light_flash"):
+        yield False
+        return
+    bright = _lamp_number(SETTINGS.get("light_flash_brightness"), 1.0, 0.0, 1.0)
+    apply_light(on=True, brightness=bright)
+    try:
+        yield True
+    finally:
+        apply_light()
+
+
+def _light_lead_s():
+    """How long the lamp is on before the shutter."""
+    return _lamp_number(SETTINGS.get("light_flash_lead_s"), 3.0, 0.0, 30.0)
+
+
+@contextmanager
+def light_for_shot():
+    """Hold the lamp on across one capture.
+
+    A frame taken in the dark is useless, but a lamp left on through a run that
+    lasts days would cook the subject and waste power, so it is borrowed for the
+    frame instead of switched on for the run. Afterwards it goes back to whatever
+    the user set, so this can run per frame for days without touching their
+    choice.
+
+    The lead is not only for the lamp to warm up. While it is off the scene is
+    black and the auto white balance has nothing to converge on: measured on the
+    Pi, a one second lead left frames about 30 % heavy in blue, three seconds
+    came out clean. A run that pinned its exposure at the start needs the lead
+    only for the lamp itself.
+    """
+    with lamp_lit() as lit:
+        if lit:
+            lead = _light_lead_s()
+            if lead > 0:
+                time.sleep(lead)
+        yield
 
 
 HTML = r"""
@@ -511,17 +767,99 @@ function initLiveSettings() {
 window.addEventListener("DOMContentLoaded", initLight);
 window.addEventListener("DOMContentLoaded", initPower);
 window.addEventListener("DOMContentLoaded", initRecorder);
+// -------------------------------------------------------------- who is in charge
+// The page keeps a lease alive on a heartbeat. That covers two things the server
+// cannot work out for itself: one camera has one owner, so only one browser may
+// drive it; and a browser that is gone must not keep it - a closed tab leaves a
+// socket that stays writable for a long time, so "is anyone still there?" has to
+// be asked out loud.
+let camInCharge = false;
+
+function previewWanted() {
+    const on = document.querySelector('input[name="preview_enabled"]');
+    const focus = document.querySelector('input[name="focus_mode"]');
+    return {
+        enabled: (!on || on.checked) && camInCharge,
+        focus: !!(focus && focus.checked),
+    };
+}
+
+function stopPreview() {
+    const img = document.getElementById("preview_img");
+    if (img) { img.remove(); }   // taking it out of the page closes the stream
+}
+
+function renderPreview(force) {
+    const wrap = document.getElementById("preview_media");
+    if (!wrap) return;
+    const want = previewWanted();
+    if (!want.enabled) {
+        wrap.classList.add("off");
+        stopPreview();
+        return;
+    }
+    wrap.classList.remove("off");
+    let img = document.getElementById("preview_img");
+    if (!img) {
+        img = document.createElement("img");
+        img.id = "preview_img";
+        img.className = "rot";
+        img.alt = "Live preview";
+        wrap.appendChild(img);
+    }
+    img.onerror = () => {
+        // The server ends a stream when it decides nobody is watching, and a tab
+        // that was hidden for a while counts. Ask again rather than leaving a
+        // dead picture on screen.
+        setTimeout(() => { renderPreview(true); }, 2500);
+    };
+    const source = want.focus ? "/focus" : "/stream";
+    if (force || (img.getAttribute("src") || "").split("?")[0] !== source) {
+        img.src = source + "?t=" + Date.now();
+    }
+}
+
+function initWatch() {
+    const notice = document.getElementById("lease_notice");
+    const take = document.getElementById("take_over");
+
+    function show(busyFor) {
+        if (notice) {
+            notice.style.display = camInCharge ? "none" : "";
+            if (!camInCharge) {
+                notice.textContent = "Another browser is using the camera"
+                    + (busyFor ? " (busy for " + busyFor + "s)" : "")
+                    + ". This page is read-only until it is taken over.";
+            }
+        }
+        if (take) { take.style.display = camInCharge ? "none" : ""; }
+    }
+
+    async function beat(force) {
+        try {
+            const url = "/alive" + (force ? "?take=1" : "");
+            const s = await (await fetch(url, { cache: "no-store" })).json();
+            const was = camInCharge;
+            camInCharge = !!s.in_charge;
+            show(s.holder_for_s);
+            if (camInCharge) {
+                renderPreview(!was);      // a fresh lease restarts the stream
+            } else if (was) {
+                stopPreview();
+            }
+        } catch (e) {}
+    }
+
+    if (take) { take.addEventListener("click", () => beat(true)); }
+    beat();
+    setInterval(beat, 3000);
+}
+
 function initPreviewToggle() {
     const box = document.querySelector('input[name="preview_enabled"]');
-    const wrap = document.getElementById("preview_media");
     if (!box) return;
     box.addEventListener("change", () => {
-        if (wrap) {
-            wrap.classList.toggle("off", !box.checked);
-            wrap.innerHTML = box.checked
-                ? '<img id="preview_img" src="/stream" alt="Live preview">'
-                : '';
-        }
+        renderPreview();
         const form = document.getElementById("capture_form");
         if (form) {
             fetch("/controls", { method: "POST", body: new FormData(form) }).catch(() => {});
@@ -565,7 +903,6 @@ function initCapture() {
 
 function initFocusToggle() {
     const box = document.querySelector('input[name="focus_mode"]');
-    const img = document.getElementById("preview_img");
     if (!box) return;
     box.addEventListener("change", async () => {
         // Save first, then switch the source: /stream refuses to run while focus
@@ -576,12 +913,18 @@ function initFocusToggle() {
             try { await fetch("/controls", { method: "POST", body: new FormData(form) }); }
             catch (e) {}
         }
-        if (img) {
-            img.src = box.checked
-                ? ("/focus?t=" + Date.now())
-                : ("/stream?t=" + Date.now());
-        }
+        renderPreview();
     });
+}
+
+function formatSpan(seconds) {
+    const s = Math.max(0, Math.round(seconds));
+    const days = Math.floor(s / 86400), hours = Math.floor((s % 86400) / 3600),
+          mins = Math.floor((s % 3600) / 60);
+    if (days) { return days + "d " + hours + "h"; }
+    if (hours) { return hours + "h " + mins + "m"; }
+    if (mins) { return mins + "m " + (s % 60) + "s"; }
+    return s + "s";
 }
 
 function initTimelapse() {
@@ -591,6 +934,8 @@ function initTimelapse() {
     const info = document.getElementById("tl_status");
     const interval = document.getElementById("tl_interval");
     const unit = document.getElementById("tl_interval_unit");
+    const maxField = document.getElementById("tl_max");
+    const maxUnit = document.getElementById("tl_max_unit");
 
     async function refresh() {
         try {
@@ -599,8 +944,14 @@ function initTimelapse() {
             let text;
             if (s.active) {
                 text = "running · " + s.session + " · frames " + s.frames + " · next in " + s.countdown_s + "s";
+                if (typeof s.remaining_s === "number") {
+                    text += " · " + formatSpan(s.remaining_s) + " left";
+                }
+                if (s.locked) { text += " · exposure locked"; }
             } else if (s.frames) {
-                text = "stopped · " + s.session + " · frames " + s.frames + (s.last_error ? " · " + s.last_error : "");
+                text = "stopped · " + s.session + " · frames " + s.frames
+                     + (s.stop_reason ? " · " + s.stop_reason : "")
+                     + (s.last_error ? " · " + s.last_error : "");
             } else {
                 text = "idle";
             }
@@ -617,6 +968,9 @@ function initTimelapse() {
         const amount = interval ? (parseFloat(interval.value) || 1) : 60;
         const factor = unit ? (parseFloat(unit.value) || 1) : 1;
         body.append("interval_s", String(Math.max(1, Math.round(amount * factor))));
+        const maxAmount = maxField ? (parseFloat(maxField.value) || 0) : 0;
+        const maxFactor = maxUnit ? (parseFloat(maxUnit.value) || 1) : 1;
+        body.append("max_s", String(Math.max(0, Math.round(maxAmount * maxFactor))));
         try { await fetch("/timelapse/start", { method: "POST", body }); } catch (e) {}
         refresh();
     });
@@ -875,6 +1229,17 @@ window.addEventListener("DOMContentLoaded", initWatch);
 </select>
 <div class="help">One frame per interval, at full sensor resolution. "Also save RAW" above is honoured, and a run resumes by itself after a reboot or power cut.</div>
 </div>
+<div class="row">
+<label class="title">Stop after</label>
+<input type="number" id="tl_max" min="0" step="1" value="0">
+<select id="tl_max_unit">
+<option value="1">seconds</option>
+<option value="60">minutes</option>
+<option value="3600">hours</option>
+<option value="86400">days</option>
+</select>
+<div class="help">0 = run until you press Stop. Otherwise the run ends by itself, and why it ended is kept in the status line and in the session record on the NAS. The clock starts when the run does, not at the last frame, and it keeps running across a reboot.</div>
+</div>
 <div class="checks">
 <label><input type="checkbox" name="nas_enabled" form="capture_form" {% if s.nas_enabled %}checked{% endif %}> Copy frames to NAS</label>
 </div>
@@ -900,6 +1265,18 @@ window.addEventListener("DOMContentLoaded", initWatch);
 </div>
 <button type="button" id="light_toggle">Turn on</button>
 <div class="help">Lamp via TB6612 driver: AIN1=23, AIN2=24, STBY=25, PWM=18 — {{ 'hardware' if light_pwm_hw else 'software' }} PWM.</div>
+<div class="checks">
+<label><input type="checkbox" name="light_flash" form="capture_form" {% if s.light_flash %}checked{% endif %}> Light every shot</label>
+</div>
+<div class="row">
+<label class="title">Flash brightness, %</label>
+<input type="number" name="light_flash_brightness" form="capture_form" min="0" max="100" step="5" value="{{ (s.light_flash_brightness * 100) | int }}">
+</div>
+<div class="row">
+<label class="title">Lead time, seconds</label>
+<input type="number" name="light_flash_lead_s" form="capture_form" min="0" max="30" step="0.5" value="{{ s.light_flash_lead_s }}">
+<div class="help">With "Light every shot" the lamp comes on this long before the shutter and goes off again after it, so a run that lasts days does not keep the subject lit or the lamp hot. The lead matters more than it looks: while the lamp is off the scene is black and the auto white balance has nothing to work with, so a shot taken too soon after it comes on is tinted blue - measured here, 1 s leaves frames about 30 % heavy in blue, 3 s is clean. Leave it at 3 unless you have a reason not to.</div>
+</div>
 </div>
 </section>
 
@@ -912,6 +1289,8 @@ window.addEventListener("DOMContentLoaded", initWatch);
 <label class="toggle"><input type="checkbox" name="preview_enabled" form="capture_form" {% if s.preview_enabled %}checked{% endif %}> on</label>
 </span>
 </h2>
+<div class="notice err" id="lease_notice" style="display:none;"></div>
+<button type="button" class="power-btn" id="take_over" style="display:none;">Take over the camera</button>
 {% if not camera_ok %}
 <div class="media"><span style="color:#aaa;">picamera2 is not available</span></div>
 {% elif not s.preview_enabled %}
@@ -1074,8 +1453,31 @@ def read_form():
     except Exception:
         min_free = 10.0
     SETTINGS["nas_min_free_percent"] = max(0.0, min(50.0, min_free))
+    # Lamp for the shot. A frame taken in the dark is useless, but a lamp left on
+    # through a run that lasts days is not an option either, so it is switched
+    # per frame instead: on `light_flash_lead_s` before, off again after.
+    SETTINGS["light_flash"] = request.form.get("light_flash") == "on"
+    try:
+        flash_pct = float(request.form.get(
+            "light_flash_brightness",
+            (SETTINGS.get("light_flash_brightness", 1.0) or 0) * 100) or 0)
+    except Exception:
+        flash_pct = 100.0
+    SETTINGS["light_flash_brightness"] = max(0.0, min(1.0, flash_pct / 100.0))
+    try:
+        lead = float(request.form.get(
+            "light_flash_lead_s", SETTINGS.get("light_flash_lead_s", 1.0)) or 0)
+    except Exception:
+        lead = 1.0
+    SETTINGS["light_flash_lead_s"] = max(0.0, min(30.0, lead))
     focus_crop = request.form.get("focus_crop", SETTINGS.get("focus_crop", "640x480"))
+    crop_before = SETTINGS.get("focus_crop", "640x480")
     SETTINGS["focus_crop"] = focus_crop if focus_crop in FOCUS_CROPS else "640x480"
+    # A new look through the focus helper: the old peak was measured on another
+    # crop (or another scene) and would make the meter look worse than it is.
+    if SETTINGS["focus_mode"] and (not focus_before
+                                   or crop_before != SETTINGS["focus_crop"]):
+        focus_score_reset()
 
     SETTINGS["awb"] = awb if awb in AWB_MODES else "auto"
     SETTINGS["metering"] = metering if metering in METERING_MODES else "centre"
@@ -1115,9 +1517,7 @@ def capture():
     with capture_lock:
         if not cam.AVAILABLE:
             return False, "picamera2 is not available on this host", ""
-        if not camera.running:
-            camera.start(camera_size())
-        camera.apply_controls(effective_controls())
+        camera_ensure()
 
         if TMP_IMAGE_PATH.exists():
             try:
@@ -1126,13 +1526,14 @@ def capture():
                 pass
 
         raw_target = RAW_PATH if SETTINGS.get("save_raw") else None
-        ok, err = camera.capture(
-            TMP_IMAGE_PATH,
-            quality=SETTINGS["quality"],
-            raw_path=raw_target,
-            target_size=still_output_size(),
-            rotate=SETTINGS.get("rotation", 0),
-        )
+        with light_for_shot():
+            ok, err = camera.capture(
+                TMP_IMAGE_PATH,
+                quality=SETTINGS["quality"],
+                raw_path=raw_target,
+                target_size=still_output_size(),
+                rotate=SETTINGS.get("rotation", 0),
+            )
         if ok and TMP_IMAGE_PATH.exists():
             os.replace(TMP_IMAGE_PATH, IMAGE_PATH)
             info = f"picamera2 · preset {SETTINGS['resolution']}"
@@ -1155,6 +1556,14 @@ _tl_lock = threading.Lock()
 _tl_state = {}
 
 
+def _parse_started_at(text):
+    """Local epoch seconds for a state file written before the field existed."""
+    try:
+        return time.mktime(time.strptime(str(text), "%Y-%m-%dT%H:%M:%S"))
+    except Exception:
+        return 0.0
+
+
 def timelapse_load():
     """Read state.json; on start-up this is what resumes an interrupted run."""
     global _tl_state
@@ -1168,6 +1577,8 @@ def timelapse_load():
         state = {}
     state.setdefault("active", False)
     state.setdefault("interval_s", 60.0)
+    state.setdefault("max_s", 0.0)
+    state.setdefault("stop_reason", "")
     state.setdefault("frames", 0)
     state.setdefault("next_shot_at", 0.0)
     state.setdefault("last_shot_at", 0.0)
@@ -1176,6 +1587,11 @@ def timelapse_load():
     state.setdefault("quality", 93)
     state.setdefault("min_free_mb", 500)
     state.setdefault("last_error", "")
+    state.setdefault("lock", {})
+    if not state.get("started_at_epoch"):
+        # A resumed run has to keep counting against its own limit, and the only
+        # record of when it began is the readable timestamp.
+        state["started_at_epoch"] = _parse_started_at(state.get("started_at"))
     with _tl_lock:
         _tl_state = state
     return state
@@ -1197,12 +1613,53 @@ def timelapse_active():
         return bool(_tl_state.get("active"))
 
 
+def timelapse_lock():
+    """The exposure and white balance a run has pinned, or empty if it has none.
+
+    A run is meant to look like one moment stretched out, and that only holds if
+    the camera does not re-decide per frame - so the values are measured once, at
+    the start, and handed to the camera with every frame after that.
+
+    Empty once the run is over, while the values stay in the state file so the
+    session record can still say what the run was shot with. The camera goes back
+    to judging the scene itself.
+    """
+    with _tl_lock:
+        if not _tl_state.get("active"):
+            return {}
+        lock = _tl_state.get("lock") or {}
+    return dict(lock) if isinstance(lock, dict) else {}
+
+
+def timelapse_remaining():
+    """Seconds left in the run, or None when it is set to run until stopped.
+
+    Measured from when the run started rather than from the last frame, so the
+    length of a run does not drift with the time each frame takes to capture.
+    """
+    with _tl_lock:
+        state = dict(_tl_state)
+    if not state.get("active"):
+        return None
+    limit = _number(state.get("max_s"), 0.0, 0.0, 366 * 86400)
+    started = _number(state.get("started_at_epoch"), 0.0, 0.0, 4e9)
+    if limit <= 0 or started <= 0:
+        return None
+    return limit - (time.time() - started)
+
+
 def timelapse_status():
     with _tl_lock:
         state = dict(_tl_state)
     state["interval_s"] = max(1.0, float(state.get("interval_s", 60) or 60))
+    state["max_s"] = _number(state.get("max_s"), 0.0, 0.0, 366 * 86400)
     next_at = float(state.get("next_shot_at", 0) or 0)
     state["countdown_s"] = max(0, int(round(next_at - time.time()))) if state.get("active") else 0
+    left = timelapse_remaining()
+    state["remaining_s"] = None if left is None else max(0, int(round(left)))
+    # Whether the camera is pinned right now, not whether the last run was: the
+    # values outlive the run so the record can keep them.
+    state["locked"] = bool(timelapse_lock())
     state["dir"] = str(TIMELAPSE_DIR)
     nas_ready, nas_reason = nas_check()
     state["nas_enabled"] = bool(SETTINGS.get("nas_enabled"))
@@ -1246,6 +1703,7 @@ def timelapse_write_meta(session=None):
     if not folder.is_dir():
         return
     manual = bool(SETTINGS.get("manual_exposure"))
+    lock = state.get("lock") or {}
     meta = {
         "session": session,
         "started_at": state.get("started_at", ""),
@@ -1267,6 +1725,14 @@ def timelapse_write_meta(session=None):
         "sharpness": SETTINGS.get("sharpness"),
         "light_on": SETTINGS.get("light_on"),
         "light_brightness": SETTINGS.get("light_brightness"),
+        "light_flash": bool(SETTINGS.get("light_flash")),
+        "light_flash_brightness": SETTINGS.get("light_flash_brightness"),
+        "light_flash_lead_s": SETTINGS.get("light_flash_lead_s"),
+        "max_s": float(state.get("max_s", 0) or 0),
+        "stop_reason": str(state.get("stop_reason", "") or ""),
+        "locked_exposure_us": lock.get("exposure_us"),
+        "locked_gain": lock.get("gain"),
+        "locked_colour_gains": lock.get("colour_gains"),
     }
     try:
         tmp = folder / (SESSION_META + ".tmp")
@@ -1278,15 +1744,59 @@ def timelapse_write_meta(session=None):
     _nas_forget(session)         # the copy on the NAS is now out of date
 
 
-def timelapse_start(interval_s):
+def _measure_run_lock():
+    """Measure the exposure and white balance once, to be reused by every frame.
+
+    A run is meant to look like one moment stretched out, and that only holds if
+    the camera stops re-deciding: the auto-exposure drifts with the light, and
+    the auto white balance has almost nothing to work with between frames, when
+    the lamp is off and the scene is black. That is what left a run of frames
+    tinted blue while the same scene shot under a lamp turned on was neutral.
+
+    The measurement is therefore taken in the light the frames will be shot in -
+    lamp on, at the same brightness - and only then is the camera pinned to
+    whatever it found. Returns {} when it cannot be measured, in which case the
+    run carries on with the camera deciding per frame.
+    """
+    if not cam.AVAILABLE:
+        return {}
+    try:
+        with capture_lock:
+            # Deliberately without a lock: this is the one moment the AE and AWB
+            # are supposed to be free to work the scene out, so the run is not
+            # marked active until the measurement is in hand.
+            camera_ensure()
+            with lamp_lit():
+                lead = _light_lead_s()
+                if lead > 0:
+                    time.sleep(lead)
+                lock = camera.measure_lock()
+    except Exception as exc:
+        app.logger.warning("timelapse: exposure measurement failed: %s", exc)
+        return {}
+    if not lock:
+        app.logger.warning("timelapse: no exposure measured, frames stay on auto")
+    return lock
+
+
+def timelapse_start(interval_s, max_s=0.0):
+    # Focus mode is left behind before a run starts, so its denoiser-off and
+    # sharpening-neutral overrides cannot end up in the frames - or in the record
+    # of how they were shot.
+    focus_mode_off("a run is starting")
+    lock = _measure_run_lock()
     session = _new_session_name()
     with _tl_lock:
         _tl_state.update({
             "active": True,
             "session": session,
             "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "started_at_epoch": time.time(),
             "ended_at": "",
             "interval_s": max(1.0, float(interval_s)),
+            "max_s": _number(max_s, 0.0, 0.0, 366 * 86400),
+            "stop_reason": "",
+            "lock": lock,
             "save_raw": bool(SETTINGS.get("save_raw")),
             "quality": int(SETTINGS.get("quality", 93)),
             "frames": 0,
@@ -1296,16 +1806,21 @@ def timelapse_start(interval_s):
             "last_error": "",
         })
     timelapse_save()
+    camera.apply_controls(effective_controls())   # pin what was just measured
     timelapse_write_meta(session)
     return timelapse_status()
 
 
-def timelapse_stop():
+def timelapse_stop(reason=""):
     with _tl_lock:
         _tl_state["active"] = False
         _tl_state["ended_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        _tl_state["stop_reason"] = str(reason or "")
     timelapse_save()
     timelapse_write_meta()
+    # The scene is the camera's to judge again, for the preview and for photos.
+    # The values stay in the state, so the record still says how it was shot.
+    camera.apply_controls(effective_controls())
     return timelapse_status()
 
 
@@ -1706,6 +2221,7 @@ def timelapse_shot():
             _tl_state["active"] = False
             _tl_state["last_error"] = "stopped: low disk space"
         timelapse_save()
+        camera.apply_controls(effective_controls())
         return
 
     ok, err = False, ""
@@ -1715,16 +2231,15 @@ def timelapse_shot():
             if not cam.AVAILABLE:
                 ok, err = False, "picamera2 is not available"
             else:
-                if not camera.running:
-                    camera.start(camera_size(), **orientation_flags())
-                camera.apply_controls(effective_controls())
-                ok, err = camera.capture(
-                    tmp_jpg,
-                    quality=int(state.get("quality", 93)),
-                    raw_path=tmp_raw,
-                    target_size=still_output_size(),
-                    rotate=SETTINGS.get("rotation", 0),
-                )
+                camera_ensure()
+                with light_for_shot():
+                    ok, err = camera.capture(
+                        tmp_jpg,
+                        quality=int(state.get("quality", 93)),
+                        raw_path=tmp_raw,
+                        target_size=still_output_size(),
+                        rotate=SETTINGS.get("rotation", 0),
+                    )
     except Exception as exc:
         ok, err = False, str(exc)
 
@@ -1772,7 +2287,15 @@ def timelapse_tick():
         nas_prune()
     except Exception:
         pass
+    try:                     # nor may a browser that left keep it open
+        camera_idle_check()
+    except Exception:
+        pass
     if not active:
+        return 1.0
+    left = timelapse_remaining()
+    if left is not None and left <= 0:
+        timelapse_stop("reached the run limit")
         return 1.0
     delay = next_at - time.time()
     if delay > 0:
@@ -1915,6 +2438,55 @@ def image():
     )
 
 
+# Requests that do not touch the camera, or that have to get through for the
+# lease to work at all.
+LEASE_EXEMPT = "/ /alive /image /image.jpg /timelapse/state /focus/score".split()
+
+
+@app.after_request
+def _remember_page(response):
+    """Hand a page its id, so every later request can be tied back to it."""
+    ident = getattr(g, "new_page_id", "")
+    if ident:
+        response.set_cookie(PAGE_COOKIE, ident, max_age=7 * 86400,
+                            samesite="Lax")
+    return response
+
+
+@app.before_request
+def _one_browser_at_a_time():
+    """Refuse camera work from a page that does not hold the lease.
+
+    A lose-lease page is told so by its heartbeat and stops asking, so the
+    streams answer with an empty body rather than an error - the browser would
+    show an error page instead of the notice it is already displaying.
+    """
+    path = request.path
+    if path in LEASE_EXEMPT or path.startswith("/static/"):
+        return None
+    if in_charge():
+        return None
+    if path in ("/stream", "/focus"):
+        return "", 204
+    if request.method == "POST":
+        return jsonify(error="another browser is using the camera"), 409
+    return None
+
+
+@app.route("/alive")
+def alive():
+    """Heartbeat from an open page, and how it learns whether it is in charge."""
+    take = request.args.get("take") in ("1", "true", "yes")
+    mine = watch_beat(_page_id(), take=take)
+    with _watch_lock:
+        seen = _watchers.get(_controller, 0.0)
+    return jsonify(
+        in_charge=mine,
+        holder="" if mine else _controller,
+        holder_for_s=round(max(0.0, time.monotonic() - seen), 1) if seen else 0.0,
+    )
+
+
 @app.route("/stream")
 def stream():
     """Live MJPEG preview; keeps running while stills are captured."""
@@ -1926,15 +2498,52 @@ def stream():
         # The focus helper needs the camera to itself; the encoder and
         # capture_array("main") cannot share it. Focus mode wins.
         return "", 204
-    if not camera.running:
-        camera.start(camera_size(), **orientation_flags())
+    camera_ensure()
     return Response(
-        camera.frames(),
+        camera.frames(keep_alive=stream_watcher()),
         mimetype="multipart/x-mixed-replace; boundary=frame",
     )
 
 
 FOCUS_BLOCK_S = 5.0      # how long the preview stands down for the focus helper
+
+# Focus sharpness meter. The focus stream is the only thing capturing frames
+# while focus mode is on, so the score is never measured on demand: the stream
+# hands over what it has just measured and the page reads the last value back.
+# Polling therefore cannot touch the camera, which in this app is the difference
+# between a live preview and a dead one.
+FOCUS_SCORE_LOCK = threading.Lock()
+FOCUS_SCORE_HISTORY = 60    # samples kept for the small bar chart next to the meter
+FOCUS_SCORE = {
+    "score": None,      # sharpness of the last focus frame
+    "peak": 0.0,        # best value seen since the meter was reset
+    "at": 0.0,          # time.monotonic() when that frame was measured
+    "frames": 0,        # frames measured since the reset
+    "crop": "",
+    "history": [],
+}
+
+
+def focus_score_reset():
+    """Forget the peak: what the UI does when a new focusing attempt starts."""
+    with FOCUS_SCORE_LOCK:
+        FOCUS_SCORE.update(score=None, peak=0.0, at=0.0, frames=0, history=[])
+
+
+def focus_note_score(score, crop):
+    """Record the sharpness the focus stream has just measured."""
+    if score is None:
+        return
+    with FOCUS_SCORE_LOCK:
+        score = round(float(score), 1)
+        FOCUS_SCORE["score"] = score
+        FOCUS_SCORE["peak"] = max(FOCUS_SCORE["peak"], score)
+        FOCUS_SCORE["at"] = time.monotonic()
+        FOCUS_SCORE["frames"] += 1
+        FOCUS_SCORE["crop"] = f"{crop[0]}x{crop[1]}"
+        history = FOCUS_SCORE["history"]
+        history.append(score)
+        del history[:-FOCUS_SCORE_HISTORY]
 
 
 def _focus_begin():
@@ -1949,29 +2558,51 @@ def _focus_begin():
     camera.apply_controls(effective_controls())
 
 
-def _focus_frames(crop):
+def _focus_frames(crop, keep_alive=None):
     """Stream of 1:1 centre crops taken from full-resolution frames.
 
     The preview encoder and capture_array("main") cannot use the camera at the
     same time - the same exclusivity that keeps recording and the preview apart.
-    The block is refreshed every frame and expires on its own, so a stream that
-    ends without cleaning up cannot leave the preview disabled.
+
+    The stream ends as soon as nobody is watching it, and hands the camera back
+    on the way out. A focus stream whose browser had gone away used to keep
+    refreshing the block for ever, which is what left the preview permanently
+    blank; waiting for the block to expire cannot help, because the stream is
+    exactly the thing that keeps it alive.
     """
     _focus_begin()
     misses = 0
-    while True:
-        camera.preview_blocked_until = time.monotonic() + FOCUS_BLOCK_S
-        data = camera.focus_jpeg(crop)
-        if data:
-            misses = 0
-            yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + data + b"\r\n"
-            continue
-        misses += 1
-        if misses in (5, 20):
-            app.logger.warning(
-                "focus stream: %d captures failed in a row (%s)",
-                misses, camera.last_error)
-        time.sleep(0.2 if misses < 10 else 1.0)
+    try:
+        while True:
+            if keep_alive is not None and not keep_alive():
+                app.logger.info("focus stream: nobody is watching any more")
+                return
+            camera.preview_blocked_until = time.monotonic() + FOCUS_BLOCK_S
+            try:
+                data, score = camera.focus_frame(crop)
+            except Exception as exc:
+                # Belt and braces around the capture: a stream that dies here
+                # leaves the browser with a black picture it never asks for
+                # again, so an unexpected failure is a missed frame and retried.
+                data, score = None, None
+                app.logger.warning("focus stream: %s: %s", type(exc).__name__, exc)
+            if data:
+                misses = 0
+                # Measured on the pixels that are about to be sent, so the number
+                # always describes what is on screen.
+                focus_note_score(score, crop)
+                yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + data + b"\r\n"
+                continue
+            misses += 1
+            if misses in (5, 20):
+                app.logger.warning(
+                    "focus stream: %d captures failed in a row (%s)",
+                    misses, camera.last_error)
+            time.sleep(0.2 if misses < 10 else 1.0)
+    finally:
+        # Hand the camera back at once instead of waiting out the block, so the
+        # preview resumes the moment the focus view is closed.
+        camera.preview_blocked_until = 0.0
 
 
 @app.route("/focus/check")
@@ -1979,8 +2610,7 @@ def focus_check():
     """One focus capture as JSON, so the path can be tested without a stream."""
     if not cam.AVAILABLE:
         return jsonify(ok=False, error="picamera2 is not available"), 503
-    if not camera.running:
-        camera.start(camera_size(), **orientation_flags())
+    camera_ensure()
     crop = (640, 480)
     try:
         w, h = str(SETTINGS.get("focus_crop", "640x480")).lower().split("x")
@@ -2012,6 +2642,7 @@ def focus_check():
         frames=shots,
         bytes=len(data or b""),
         ms=times,
+        sharpness=scores,
         total_ms=int((time.time() - started) * 1000),
         crop=f"{crop[0]}x{crop[1]}",
         camera={
@@ -2028,8 +2659,7 @@ def focus():
     """Focus helper: 1:1 centre crops, no scaling, low frame rate."""
     if not cam.AVAILABLE:
         return "Live preview is not available (picamera2 missing)", 503
-    if not camera.running:
-        camera.start(camera_size(), **orientation_flags())
+    camera_ensure()
     crop = (640, 480)
     try:
         w, h = str(SETTINGS.get("focus_crop", "640x480")).lower().split("x")
@@ -2037,8 +2667,36 @@ def focus():
     except Exception:
         pass
     return Response(
-        _focus_frames(crop),
+        _focus_frames(crop, keep_alive=stream_watcher()),
         mimetype="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+@app.route("/focus/score", methods=["GET", "POST"])
+def focus_score_route():
+    """Sharpness of the frame the focus helper is showing right now.
+
+    GET only reads back what the focus stream measured for the frame it has just
+    sent - it never captures, so the page can poll it while the camera is busy.
+    POST clears the peak, starting a fresh comparison.
+    """
+    if request.method == "POST":
+        focus_score_reset()
+    with FOCUS_SCORE_LOCK:
+        snap = dict(FOCUS_SCORE, history=list(FOCUS_SCORE["history"]))
+    peak, score = snap["peak"], snap["score"]
+    return jsonify(
+        ok=score is not None,
+        score=score,
+        peak=peak or None,
+        percent=(round(100.0 * score / peak, 1)
+                 if score is not None and peak else None),
+        frames=snap["frames"],
+        crop=snap["crop"],
+        age_ms=(int((time.monotonic() - snap["at"]) * 1000)
+                if snap["frames"] else None),
+        history=snap["history"],
+        focus_mode=bool(SETTINGS.get("focus_mode")),
     )
 
 
@@ -2054,7 +2712,11 @@ def timelapse_start_route():
         interval = float(data.get("interval_s") or 60)
     except Exception:
         interval = 60.0
-    return jsonify(timelapse_start(interval))
+    try:
+        max_s = float(data.get("max_s") or 0)
+    except Exception:
+        max_s = 0.0
+    return jsonify(timelapse_start(interval, max_s))
 
 
 @app.route("/timelapse/stop", methods=["POST"])
@@ -2126,7 +2788,8 @@ def power():
 
 # Start the camera and the timelapse worker once everything is defined, so that
 # a reboot resumes an interrupted timelapse from state.json.
-camera_start()
+# The camera is deliberately not started here: it comes up when a page asks for
+# the preview or a frame is due, and is released again when nothing wants it.
 timelapse_load()
 threading.Thread(target=timelapse_worker, daemon=True).start()
 

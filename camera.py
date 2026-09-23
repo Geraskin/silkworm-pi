@@ -42,7 +42,7 @@ except Exception:  # pragma: no cover
     lc = None
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageChops, ImageFilter, ImageStat
 
     HAVE_PIL = True
 except Exception:
@@ -465,15 +465,80 @@ class Camera:
         if left > 0:
             time.sleep(left)
 
-    def frames(self):
+    def measure_lock(self, samples=12, gap=0.4, tolerance=0.02):
+        """Let the AE and AWB settle over real frames, then report what they chose.
+
+        Reading the metadata alone is not enough: it describes the last frame that
+        was taken, and between the frames of a run none are, so a loop over it
+        would only ever return the same answer. Each sample here takes a frame,
+        which is what drives the algorithms on a step - so the loop keeps going
+        until two samples agree.
+
+        That matters more than it looks. A scene the camera has only known in the
+        dark walks in from a long way off, and stopping the measurement early is
+        what left frames several per cent heavy in blue while the same scene shot
+        under a lamp left on was neutral. A scene that is already lit settles in
+        three or four frames; a dark one takes all of them.
+
+        Returns {} when it cannot be measured, so a caller can fall back to
+        letting the camera decide per frame.
+        """
+        def near(a, b):
+            return abs(a - b) <= tolerance * max(abs(a), abs(b), 1e-6)
+
+        lock, previous, taken = {}, None, 0
+        for _ in range(max(1, int(samples))):
+            self._note_start("exposure measurement")
+            try:
+                with self._lock:
+                    self._wait_for_encoder()
+                    request = self._picam.capture_request()
+                    try:
+                        md = request.get_metadata()
+                    finally:
+                        request.release()
+            except Exception as exc:
+                self.last_error = f"measurement failed: {type(exc).__name__}: {exc}"
+                return {}
+            finally:
+                self._note_end()
+            gains = md.get("ColourGains") or (1.0, 1.0)
+            lock = {
+                "exposure_us": int(md.get("ExposureTime", 0) or 0),
+                "gain": round(float(md.get("AnalogueGain", 1.0) or 1.0), 3),
+                "colour_gains": [round(float(gains[0]), 3), round(float(gains[1]), 3)],
+            }
+            taken += 1
+            if (taken >= 3 and previous
+                    and near(previous["exposure_us"], lock["exposure_us"])
+                    and near(previous["gain"], lock["gain"])
+                    and all(near(a, b) for a, b in
+                            zip(previous["colour_gains"], lock["colour_gains"]))):
+                break
+            previous = dict(lock)
+            time.sleep(max(0.0, float(gap)))
+        if lock.get("exposure_us", 0) <= 0:
+            return {}
+        lock["samples"] = taken          # the record can say how settled it was
+        self.last_error = ""
+        return lock
+
+    def frames(self, keep_alive=None):
         """Yield multipart MJPEG chunks for an HTTP response.
 
         Each camera frame is sent exactly once (the encoder replaces the most
         recent frame as fast as the sensor produces them).
+
+        `keep_alive` is asked before every frame; when it says no, the response
+        ends. That is what stops a client that closed its tab from keeping the
+        camera: the socket stays writable long after the browser is gone, so the
+        server cannot tell on its own, and the encoder would keep running for it.
         """
         seq = None
         try:
             while True:
+                if keep_alive is not None and not keep_alive():
+                    break
                 if (not self.preview_enabled
                         or time.monotonic() < self.preview_blocked_until):
                     # Keep the response open and leave the encoder alone. Stopping
@@ -683,6 +748,21 @@ class Camera:
                 controls["NoiseReductionMode"] = _DENOISE_VALUE.get(
                     s.get("denoise", "fast"), 1
                 )
+
+            # A run holds one exposure and one white balance for all of its frames,
+            # measured once when it starts. Letting the AE and AWB re-decide per
+            # frame is what makes a timelapse flicker and drift in colour - and
+            # between the frames the lamp is off and the scene is black, which is
+            # the worst possible thing to decide from.
+            lock = s.get("locked") or {}
+            if lock:
+                controls["AeEnable"] = False
+                controls["ExposureTime"] = int(lock.get("exposure_us", 0) or 0)
+                controls["AnalogueGain"] = float(lock.get("gain", 1.0) or 1.0)
+                gains = list(lock.get("colour_gains") or [])
+                if len(gains) == 2:
+                    controls["AwbEnable"] = False
+                    controls["ColourGains"] = (float(gains[0]), float(gains[1]))
 
             # Hflip/Vflip are not libcamera controls on the Pi: they are applied
             # through the configuration transform (see start/ensure_orientation).
