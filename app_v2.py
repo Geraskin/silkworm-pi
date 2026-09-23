@@ -1260,11 +1260,14 @@ def nas_target():
 def nas_check():
     """Return (ready, reason). A couple of stat calls when configured.
 
-    The folder has to be an actual mount point, not merely a directory that
-    exists. If the share is not mounted the path is an ordinary folder on the SD
-    card: frames would be copied onto the card a second time, and the rotation
-    would then delete the "original" because the copy looks safe. Pointing it at
-    the cache itself is refused for the same reason - there the copy *is* the
+    What matters is that the folder lives on a *different filesystem* from the
+    card, not that it is a mount point itself: the usual layout is a share
+    mounted at /mnt/video_sources with the frames going to a subfolder of it.
+
+    If the share is not mounted, the path is just a directory on the SD card.
+    Frames would then be copied onto the card a second time and the rotation
+    would delete the "original" because the copy looks safe. Pointing it at the
+    cache itself is refused for the same reason - there the copy *is* the
     original.
     """
     if not SETTINGS.get("nas_enabled"):
@@ -1274,14 +1277,17 @@ def nas_check():
         return False, "no folder set"
     if not target.is_dir():
         return False, f"{target} is not there"
-    if not os.path.ismount(str(target)):
-        return False, f"{target} is not a mount point"
     try:
         cache = TIMELAPSE_DIR.resolve()
         if target == cache or cache in target.parents:
             return False, f"{target} is inside the local cache"
     except OSError:
         pass
+    try:
+        if os.stat(target).st_dev == os.stat(BASE_DIR).st_dev:
+            return False, f"{target} is on the card, not on a mounted share"
+    except OSError:
+        return False, f"{target} cannot be inspected"
     return True, ""
 
 
