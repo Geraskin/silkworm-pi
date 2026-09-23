@@ -1182,6 +1182,7 @@ def timelapse_write_meta(session=None):
         os.replace(tmp, folder / SESSION_META)
     except OSError:
         pass
+    _nas_forget(session)         # the copy on the NAS is now out of date
 
 
 def timelapse_start(interval_s):
@@ -1228,9 +1229,12 @@ NAS_PRUNE_BACKOFF_S = 60.0    # after a pass that could not free anything
 _nas_lock = threading.Lock()
 _nas_next_try = 0.0           # monotonic deadlines: the Pi has no RTC
 _nas_prune_next = 0.0
-_nas_pending = 0              # cached, so the status endpoint stays cheap
-# Session records already on the NAS, keyed by path -> (mtime, size), so a file
-# that changes as the run progresses is re-sent and an unchanged one is not.
+_nas_pending = None           # counted lazily; see nas_pending()
+_nas_generation = 0          # bumped whenever local content changes
+# Where each session record was last sent, keyed by path -> digest of the
+# content, so a record that changes as the run progresses is re-sent and an
+# unchanged one is not. A digest rather than (mtime, size) because timestamps
+# are coarse and a same-length rewrite inside one tick would look unchanged.
 _nas_meta_sent = {}
 # Sessions with nothing left to upload. Only the session being written to can
 # gain frames, and that one is dropped from here on every shot, so a sweep can
@@ -1301,8 +1305,49 @@ def disk_free_percent():
 
 
 def nas_pending():
-    """Files still waiting for the NAS as of the last sweep. Cheap on purpose."""
+    """Files still waiting for the NAS. Cheap on purpose.
+
+    Counted once before the first sweep and taken from the sweep after that. The
+    status endpoint polls this, so it must not walk the cache every time. Before
+    any sweep the honest answer is "everything local": after a restart nothing is
+    known to be up there, and if the NAS stayed away that is where the count
+    would settle anyway. Without this it read 0 until a sweep finished, so a
+    backlog looked like an empty queue for as long as the first upload took.
+    """
+    global _nas_pending
+    if _nas_pending is None:
+        _nas_pending = _local_file_count()
     return _nas_pending
+
+
+def _nas_forget(session):
+    """Declare that a session's local copy changed, so the NAS may lag behind.
+
+    Called whenever a frame lands and whenever the session record is rewritten.
+    Without it a session archived mid-run stays marked complete, and then the
+    record's final `ended_at` - or a frame written while a manual sweep was in
+    flight - would only ever reach the NAS through "Sync now".
+
+    `_nas_generation` closes the same hole from the other side: it stops a sweep
+    that is already running from marking a session complete off a listing taken
+    before the change.
+    """
+    global _nas_generation
+    if session:
+        _nas_mirrored.discard(session)
+    _nas_generation += 1
+
+
+def _nas_note_frame():
+    """One more frame is on the card that the NAS has not seen.
+
+    Keeps the queue count honest between sweeps. It is otherwise only recomputed
+    at the end of a sweep, so a run would keep reporting the previous queue -
+    which is empty - while its frames were still waiting to go out.
+    """
+    global _nas_pending
+    if _nas_pending is not None:
+        _nas_pending += 1
 
 
 def nas_sessions():
@@ -1419,20 +1464,30 @@ def nas_flush(force=False):
             _nas_next_try = now + NAS_IDLE_RESCAN_S
             _nas_pending = _local_file_count()
         return {"ok": False, "reason": why, "uploaded": 0,
-                "pending": _nas_pending}
+                "pending": nas_pending()}
 
     with _nas_lock:                  # also stops a manual sweep from racing this
+        # The deadline only moves once a sweep has actually run. Moving it on the
+        # quiet path as well pushed it forward on every idle tick, so it stayed
+        # about NAS_MIN_INTERVAL_S away for ever and everything below became
+        # unreachable: a frame shot after start-up was never uploaded on its own,
+        # only by "Sync now". Checking the deadline first also keeps the idle
+        # ticks - one a second - free of a directory scan.
+        if not force and now < _nas_next_try:
+            return {"ok": True, "reason": "", "uploaded": 0,
+                    "pending": nas_pending()}
         todo = [s for s in nas_sessions()
                 if force or s.name not in _nas_mirrored]
-        if not todo or (not force and now < _nas_next_try):
+        if not todo:
             _nas_next_try = now + NAS_MIN_INTERVAL_S
             return {"ok": True, "reason": "", "uploaded": 0,
-                    "pending": _nas_pending}
+                    "pending": nas_pending()}
 
         target = nas_target()
         uploaded, pending, failed = 0, 0, ""
         try:
             for session in todo:
+                gen = _nas_generation
                 folder = nas_session_dir(target, session.name)
                 on_nas = _nas_listing(folder)
                 left = 0
@@ -1463,7 +1518,9 @@ def nas_flush(force=False):
                     if counted:
                         left -= 1
                         pending -= 1
-                if not left:
+                # Only vouch for the session if nothing was written while this
+                # pass was listing it, or a frame could be left behind for ever.
+                if not left and gen == _nas_generation:
                     _nas_mirrored.add(session.name)
         except Exception as exc:
             failed = str(exc)
@@ -1593,7 +1650,9 @@ def timelapse_shot():
                 leftover.unlink()
             except OSError:
                 pass
-    _nas_mirrored.discard(session)       # this session has new work again
+    if ok:
+        _nas_note_frame()            # it is on the card, not yet on the NAS
+    _nas_forget(session)             # this session has new work again
 
     now = time.time()
     with _tl_lock:

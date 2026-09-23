@@ -17,6 +17,7 @@ The app runs on the Pi itself: Flask on `0.0.0.0:8080`.
 - `app_v2.py` — **main (production) version**: Flask UI, extended camera settings, manual exposure, lamp control, power actions, settings saved to `~/camweb/settings.json`.
 - `camera.py` — picamera2 backend: one camera process serves live preview (MJPEG), stills (JPEG + optional DNG) and video (H.264).
 - `app.py` — old basic version (no lamp, no extended settings). Do not touch unless explicitly needed.
+- `tests/` — host-side checks that need neither camera nor Pi (see below).
 - `README.md` — what the project is (a Raspberry Pi timelapse camera first) and how to install it.
 - `.devcontainer/` — local dev environment (Python 3.12, Flask, `gpiozero`, plus `openssh-client` + `rsync` for deployment). Machine-specific and **gitignored**: it is not part of the published repository.
 
@@ -82,6 +83,23 @@ check the response on `:8080`. Full commands are in the `deploy-pi` skill, which
 also ships `smoke-test.sh` — it starts a short timelapse, checks the frames, the
 NAS cache and the focus stream on the real hardware, and with `--reboot` verifies
 that an interrupted run resumes.
+
+## Tests
+
+`tests/` holds checks that run on any machine — no camera, no Pi, no privileges:
+`python3 tests/test_nas_export.py`, and the same for `test_nas_queue.py` and
+`test_nas_sync.py`. Each is a plain script that prints `PASS`/`FAIL` and exits
+non-zero, so they can be run in a loop.
+
+Deciding whether a folder is the share or the card needs a real mount, and a
+container cannot mount anything. `/dev/shm` is a tmpfs that already *is* a mount
+point, so it stands in for the NAS, while an ordinary folder stands in for a path
+that exists but is not a share.
+
+`test_nas_sync.py` runs the background sweep off a fake clock. The failures worth
+catching there are about *when* a pass happens rather than what it does, and a
+suite that only ever calls the sweep with `force=True` never sees them — which is
+exactly how a sweep that ran once per boot and then never again went unnoticed.
 
 ## Conventions
 
