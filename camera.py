@@ -55,6 +55,9 @@ METERING_MODES = ["centre", "spot", "average"]
 EXPOSURE_MODES = ["normal", "sport", "long"]
 DENOISE_MODES = ["off", "fast", "high_quality", "minimal"]
 
+# An operation stuck longer than this is not coming back; see Camera._watchdog.
+WATCHDOG_S = float(os.environ.get("CAMWEB_WATCHDOG_S", "45") or 45)
+
 _AWB_ENUM = {
     "auto": "Auto",
     "incandescent": "Incandescent",
@@ -133,6 +136,22 @@ class Camera:
         self.fps = int(fps)
         self.preview_bitrate = 15.0        # Mbps for the hardware MJPEG encoder
         self.preview_enabled = True
+        # Set by the focus helper: capture_array("main") and the preview encoder
+        # cannot use the camera at the same time, so the preview stands down.
+        # A deadline rather than a flag, so a focus stream that dies without
+        # cleaning up cannot wedge the preview for ever.
+        self.preview_blocked_until = 0.0
+        self.last_error = ""
+        # When the encoder was last stopped: capture_array() called straight
+        # after stop_recording() can block for ever, so captures wait it out.
+        self._encoder_stopped_at = 0.0
+        # Watchdog state. A call wedged inside libcamera never returns and never
+        # raises, so without this the app looks healthy while quietly producing
+        # no frames until somebody restarts the service by hand.
+        self._wd_lock = threading.Lock()
+        self._wd_label = ""
+        self._wd_since = 0.0
+        threading.Thread(target=self._watchdog, daemon=True).start()
         self._lock = threading.RLock()
         self._stream = _Stream()
         self._picam = None
@@ -181,11 +200,14 @@ class Camera:
         return True
 
     def reconfigure(self, still_size, hflip=False, vflip=False,
-                    preview_size=None, preview_bitrate=None) -> bool:
+                    preview_size=None, preview_bitrate=None, force=False) -> bool:
         """Restart the camera if any of its configuration changed.
 
         The preview bitrate is part of the configuration because the hardware
-        MJPEG encoder only picks it up from a fresh configure.
+        MJPEG encoder only picks it up from a fresh configure. `force` restarts
+        even when nothing changed, which the focus helper needs: it reads
+        full-resolution frames, and doing that while the preview encoder is
+        alive can deadlock the camera.
         """
         new_preview = tuple(
             preview_size) if preview_size is not None else self.preview_size
@@ -197,7 +219,7 @@ class Camera:
         want = (tuple(still_size), bool(hflip), bool(vflip), new_preview, rate)
         have = (self._still_size, self._hflip, self._vflip,
                 self.preview_size, self.preview_bitrate)
-        if want == have:
+        if want == have and not force:
             return False
         self.stop()
         self.preview_bitrate = rate
@@ -205,13 +227,14 @@ class Camera:
         return True
 
     def set_preview_enabled(self, enabled) -> bool:
-        """Turn the preview stream on/off without touching the camera config."""
+        """Turn the preview stream on/off without touching the camera config.
+
+        The encoder is deliberately not stopped here: see stop_stream().
+        """
         enabled = bool(enabled)
         if enabled == self.preview_enabled:
             return False
         self.preview_enabled = enabled
-        if not enabled:
-            self.stop_stream()
         return True
 
     def _teardown(self) -> None:
@@ -281,13 +304,81 @@ class Camera:
         return True
 
     def stop_stream(self) -> None:
+        """Stop the preview encoder. ONLY safe as part of a camera teardown.
+
+        picamera2 can block for ever in capture_array() when it follows a
+        standalone stop_recording(), and it does so silently - the capture never
+        returns and never raises, so the worker just stops making frames. The
+        encoder is therefore left running and is stopped in _teardown(), where
+        the camera is closed immediately afterwards.
+        """
         with self._lock:
             if self._picam and self._streaming:
                 try:
                     self._picam.stop_recording()
                 except Exception:
                     pass
+                self._encoder_stopped_at = time.monotonic()
             self._streaming = False
+
+    def _note_start(self, label) -> None:
+        with self._wd_lock:
+            self._wd_label = label
+            self._wd_since = time.monotonic()
+
+    def _note_end(self) -> None:
+        with self._wd_lock:
+            self._wd_since = 0.0
+
+    def _watchdog(self) -> None:
+        """Exit if a camera operation has been stuck past WATCHDOG_S.
+
+        Waiting longer cannot help - the call is not coming back - so the process
+        is ended and systemd (Restart=always) brings the service up again in a
+        few seconds. A running timelapse resumes from state.json, so the cost is a
+        short gap rather than a camera that is dead until someone notices.
+        """
+        while True:
+            time.sleep(5.0)
+            with self._wd_lock:
+                label, since = self._wd_label, self._wd_since
+            if not since:
+                continue
+            stuck = time.monotonic() - since
+            if stuck < WATCHDOG_S:
+                continue
+            self.last_error = f"{label} stuck for {stuck:.0f}s"
+            print(f"watchdog: {self.last_error}; exiting so the service restarts",
+                  flush=True)
+            os._exit(1)
+
+    def _main_array(self):
+        """One full-resolution frame as an array.
+
+        Deliberately a still capture request rather than capture_array(): the
+        latter is tied to the video stream buffers and can block for ever once
+        the preview encoder has been stopped, which is what wedged the camera.
+        """
+        self._note_start("still capture")
+        try:
+            request = self._picam.capture_request()
+            try:
+                return request.make_array("main")
+            finally:
+                request.release()
+        finally:
+            self._note_end()
+
+    def _wait_for_encoder(self, grace=1.2) -> None:
+        """Let the encoder finish letting go of the camera.
+
+        picamera2 can block indefinitely in capture_array() if it is called
+        immediately after stop_recording(). Every capture goes through here so
+        that neither the photo path nor the focus helper can hit it.
+        """
+        left = grace - (time.monotonic() - self._encoder_stopped_at)
+        if left > 0:
+            time.sleep(left)
 
     def frames(self):
         """Yield multipart MJPEG chunks for an HTTP response.
@@ -298,8 +389,11 @@ class Camera:
         seq = None
         try:
             while True:
-                if not self.preview_enabled:
-                    self.stop_stream()
+                if (not self.preview_enabled
+                        or time.monotonic() < self.preview_blocked_until):
+                    # Keep the response open and leave the encoder alone. Stopping
+                    # it here would poison the next still capture, and the browser
+                    # would be left with a blank image it never asks for again.
                     time.sleep(0.2)
                     continue
                 # Restart the preview after a reconfigure/recording, but never
@@ -310,7 +404,9 @@ class Camera:
                 if frame is not None:
                     yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
         finally:
-            self.stop_stream()
+            # The encoder is not stopped here on purpose: a client going away must
+            # not leave the camera in the state that deadlocks the next capture.
+            pass
 
     # ----------------------------------------------------------------- stills
     def capture(self, jpeg_path, quality=93, raw_path=None, target_size=None, rotate=0):
@@ -320,7 +416,8 @@ class Camera:
         with self._lock:
             try:
                 if HAVE_PIL:
-                    array = self._picam.capture_array("main")
+                    self._wait_for_encoder()
+                    array = self._main_array()
                     # libcamera's "RGB888" is V4L2 RGB24, which is stored as BGR
                     # in memory; swap the channels so PIL writes correct colours.
                     image = Image.fromarray(array[..., ::-1].copy())
@@ -366,9 +463,16 @@ class Camera:
         if not AVAILABLE or not self._running or not HAVE_PIL:
             return None
         try:
-            array = self._picam.capture_array("main")
-        except Exception:
+            # Same lock as capture(): the still path and the preview encoder must
+            # not touch the camera at the same time, and without this the capture
+            # can block for ever instead of failing.
+            with self._lock:
+                self._wait_for_encoder()
+                array = self._main_array()
+        except Exception as exc:
+            self.last_error = f"{type(exc).__name__}: {exc}"
             return None
+        self.last_error = ""
         h, w = array.shape[:2]
         cw = max(16, min(int(crop[0]), w))
         ch = max(16, min(int(crop[1]), h))

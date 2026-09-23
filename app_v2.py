@@ -112,6 +112,21 @@ def preview_size():
     return PREVIEW_SIZE
 
 
+def effective_controls():
+    """The controls the camera should have right now.
+
+    The focus helper needs the ISP out of the way, and it has to stay that way:
+    applying the neutral settings only once when the stream starts would let any
+    settings POST in the meantime quietly switch denoise and sharpening back on,
+    and the focus view would stop showing real pixels.
+    """
+    s = dict(SETTINGS)
+    if s.get("focus_mode"):
+        s["denoise"] = "off"
+        s["sharpness"] = 1.0
+    return s
+
+
 def camera_start():
     """Start the camera once and push the saved controls to it."""
     if not cam.AVAILABLE:
@@ -121,7 +136,7 @@ def camera_start():
         preview_size=preview_size(),
         **orientation_flags(),
     )
-    camera.apply_controls(SETTINGS)
+    camera.apply_controls(effective_controls())
 
 
 def load_settings():
@@ -536,10 +551,20 @@ function initFocusToggle() {
     const box = document.querySelector('input[name="focus_mode"]');
     const img = document.getElementById("preview_img");
     if (!box) return;
-    box.addEventListener("change", () => {
-        if (img) img.src = box.checked ? "/focus" : "/stream";
+    box.addEventListener("change", async () => {
+        // Save first, then switch the source: /stream refuses to run while focus
+        // mode is on, so asking for it before the setting is stored would leave
+        // a blank image behind.
         const form = document.getElementById("capture_form");
-        if (form) fetch("/controls", { method: "POST", body: new FormData(form) }).catch(() => {});
+        if (form) {
+            try { await fetch("/controls", { method: "POST", body: new FormData(form) }); }
+            catch (e) {}
+        }
+        if (img) {
+            img.src = box.checked
+                ? ("/focus?t=" + Date.now())
+                : ("/stream?t=" + Date.now());
+        }
     });
 }
 
@@ -929,6 +954,7 @@ def read_form():
         bitrate = 15.0
     SETTINGS["preview_bitrate"] = max(0.0, min(50.0, bitrate))
     SETTINGS["preview_enabled"] = request.form.get("preview_enabled") == "on"
+    focus_before = bool(SETTINGS.get("focus_mode"))
     SETTINGS["focus_mode"] = request.form.get("focus_mode") == "on"
     # NAS export. The address and credentials stay in the Pi's /etc/fstab; the app
     # only ever sees the local mount point, so nothing network-specific is stored
@@ -955,15 +981,28 @@ def read_form():
         SETTINGS["shutter"] = ival("shutter", SETTINGS["shutter"], 100, 100000)
         SETTINGS["gain"] = fval("gain", SETTINGS["gain"], 1, 16)
 
+    preview_before = bool(SETTINGS.get("preview_enabled"))
+    if not SETTINGS["focus_mode"]:
+        # Leaving focus mode has to free the preview at once. The block window is
+        # up to FOCUS_BLOCK_S long, and a /stream request landing inside it gets a
+        # 200 with no frames - which the browser shows as a permanently black
+        # image, because it never asks again.
+        camera.preview_blocked_until = 0.0
+
     save_settings()
     camera.set_preview_enabled(SETTINGS["preview_enabled"])
+    # Switching the preview or focus mode off has to restart the camera rather
+    # than just stop the encoder: an encoder stopped on its own leaves the camera
+    # in a state where the next still capture blocks for ever.
     camera.reconfigure(
         camera_size(),
         preview_size=preview_size(),
         preview_bitrate=SETTINGS["preview_bitrate"],
+        force=(bool(SETTINGS["focus_mode"]) != bool(focus_before)
+               or bool(SETTINGS["preview_enabled"]) != preview_before),
         **orientation_flags(),
     )
-    camera.apply_controls(SETTINGS)
+    camera.apply_controls(effective_controls())
 
 
 def capture():
@@ -973,7 +1012,7 @@ def capture():
             return False, "picamera2 is not available on this host", ""
         if not camera.running:
             camera.start(camera_size())
-        camera.apply_controls(SETTINGS)
+        camera.apply_controls(effective_controls())
 
         if TMP_IMAGE_PATH.exists():
             try:
@@ -1410,7 +1449,7 @@ def timelapse_shot():
             else:
                 if not camera.running:
                     camera.start(camera_size(), **orientation_flags())
-                camera.apply_controls(SETTINGS)
+                camera.apply_controls(effective_controls())
                 ok, err = camera.capture(
                     tmp_jpg,
                     quality=int(state.get("quality", 93)),
@@ -1612,6 +1651,10 @@ def stream():
         return "Live preview is not available (picamera2 missing)", 503
     if not SETTINGS.get("preview_enabled", True):
         return "", 204
+    if SETTINGS.get("focus_mode"):
+        # The focus helper needs the camera to itself; the encoder and
+        # capture_array("main") cannot share it. Focus mode wins.
+        return "", 204
     if not camera.running:
         camera.start(camera_size(), **orientation_flags())
     return Response(
@@ -1620,18 +1663,90 @@ def stream():
     )
 
 
+FOCUS_BLOCK_S = 5.0      # how long the preview stands down for the focus helper
+
+
+def _focus_begin():
+    """Keep new preview requests off the camera while the focus helper uses it.
+
+    The preview encoder is *not* stopped here on purpose. `capture_array` racing
+    an asynchronous `stop_recording()` is what deadlocks the camera; instead the
+    camera is restarted cleanly when focus mode is switched on, so by the time
+    the first frame is asked for there is no encoder left to race.
+    """
+    camera.preview_blocked_until = time.monotonic() + FOCUS_BLOCK_S
+    camera.apply_controls(effective_controls())
+
+
 def _focus_frames(crop):
-    """Slow stream of 1:1 centre crops from full-resolution frames."""
-    neutral = dict(SETTINGS)
-    neutral["denoise"] = "off"  # the ISP must not fake sharpness while focusing
-    neutral["sharpness"] = 1.0
-    camera.apply_controls(neutral)
+    """Stream of 1:1 centre crops taken from full-resolution frames.
+
+    The preview encoder and capture_array("main") cannot use the camera at the
+    same time - the same exclusivity that keeps recording and the preview apart.
+    The block is refreshed every frame and expires on its own, so a stream that
+    ends without cleaning up cannot leave the preview disabled.
+    """
+    _focus_begin()
+    misses = 0
     while True:
+        camera.preview_blocked_until = time.monotonic() + FOCUS_BLOCK_S
         data = camera.focus_jpeg(crop)
         if data:
+            misses = 0
             yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + data + b"\r\n"
-        else:
-            time.sleep(0.3)
+            continue
+        misses += 1
+        if misses in (5, 20):
+            app.logger.warning(
+                "focus stream: %d captures failed in a row (%s)",
+                misses, camera.last_error)
+        time.sleep(0.2 if misses < 10 else 1.0)
+
+
+@app.route("/focus/check")
+def focus_check():
+    """One focus capture as JSON, so the path can be tested without a stream."""
+    if not cam.AVAILABLE:
+        return jsonify(ok=False, error="picamera2 is not available"), 503
+    if not camera.running:
+        camera.start(camera_size(), **orientation_flags())
+    crop = (640, 480)
+    try:
+        w, h = str(SETTINGS.get("focus_crop", "640x480")).lower().split("x")
+        crop = (int(w), int(h))
+    except Exception:
+        pass
+    started = time.time()
+    _focus_begin()
+    try:
+        count = max(1, min(6, int(request.args.get("frames", 1))))
+    except Exception:
+        count = 1
+    times, shots, ok = [], 0, True
+    for _ in range(count):
+        camera.preview_blocked_until = time.monotonic() + FOCUS_BLOCK_S
+        step = time.time()
+        data = camera.focus_jpeg(crop)
+        times.append(int((time.time() - step) * 1000))
+        if not data:
+            ok = False
+            break
+        shots += 1
+    return jsonify(
+        ok=ok,
+        error=camera.last_error,
+        frames=shots,
+        bytes=len(data or b""),
+        ms=times,
+        total_ms=int((time.time() - started) * 1000),
+        crop=f"{crop[0]}x{crop[1]}",
+        camera={
+            "running": camera.running,
+            "streaming": camera.streaming,
+            "blocked_for_s": round(
+                max(0.0, camera.preview_blocked_until - time.monotonic()), 1),
+        },
+    )
 
 
 @app.route("/focus")
