@@ -304,6 +304,24 @@ def camera_ensure():
     return camera.running
 
 
+# What the last still was shot with, for the page to show. A choice made on the
+# user's behalf should not be invisible: seeing the numbers is what turns "auto"
+# from a black box into something you can agree with - and hold.
+LAST_SHOT = {}
+# A run shoots every frame at the lowest gain the light allows and lets the
+# shutter do the work: the two are interchangeable for exposure, but only the
+# shutter is free of the noise the gain multiplies.
+RUN_GAIN = 1.0
+
+
+def _note_last_shot():
+    """Remember what the frame that was just taken used."""
+    info = camera.last_exposure()
+    if info:
+        info["at"] = time.strftime("%H:%M:%S")
+        LAST_SHOT.update(info)
+
+
 def camera_idle_check():
     """Release the camera once nothing has wanted it for a while.
 
@@ -927,6 +945,96 @@ function formatSpan(seconds) {
     return s + "s";
 }
 
+function formatShutter(us) {
+    us = Math.round(us || 0);
+    if (us <= 0) { return "—"; }
+    if (us >= 1000000) { return (us / 1000000).toFixed(us % 1000000 ? 1 : 0) + " s"; }
+    if (us >= 1000) { return "1/" + Math.round(1000000 / us) + " s"; }
+    return us + " µs";
+}
+
+// A run is one thing being kept consistent, so while it is going the page stops
+// offering anything that would change it. The one action left is the one that
+// ends it.
+function setRunMode(active, s) {
+    const form = document.getElementById("capture_form");
+    if (form) {
+        form.querySelectorAll("input, select").forEach((el) => { el.disabled = active; });
+    }
+    ["capture_btn", "rec_start", "rec_stop", "nas_sync", "hold_shot", "tl_start",
+     "light_toggle", "light_brightness", "take_over"].forEach((id) => {
+        const el = document.getElementById(id);
+        if (el) { el.disabled = active; }
+    });
+    const banner = document.getElementById("run_banner");
+    if (!banner) return;
+    banner.style.display = active ? "" : "none";
+    if (!active) return;
+    banner.textContent = "Timelapse running · " + s.session + " · frame " + s.frames
+        + (typeof s.remaining_s === "number"
+            ? (" · " + formatSpan(s.remaining_s) + " left") : "")
+        + ". Nothing may be changed while it runs - stop it first. Fixing now:"
+        + (s.lock && s.lock.exposure_us
+            ? (" " + formatShutter(s.lock.exposure_us) + " at gain " + s.lock.gain
+               + (s.lock.chosen_by === "hand" ? " (yours)" : " (measured)"))
+            : " the camera's own choice per frame")
+        + ".";
+}
+
+function initShotNumbers() {
+    const out = document.getElementById("last_shot");
+    const hold = document.getElementById("hold_shot");
+    let last = {};
+
+    async function refresh() {
+        try {
+            const s = await (await fetch("/timelapse/state")).json();
+            last = s.last_shot || {};
+        } catch (e) { return; }
+        if (!out) return;
+        out.textContent = last.exposure_us
+            ? (formatShutter(last.exposure_us) + " · gain " + last.gain
+               + " · white balance " + (last.colour_gains || []).join(" / ")
+               + " · " + last.at)
+            : "—";
+    }
+
+    if (hold) hold.addEventListener("click", async () => {
+        if (!last.exposure_us) return;
+        const man = document.getElementById("manual_exposure");
+        if (man) {
+            man.checked = true;
+            if (typeof toggleManual === "function") { toggleManual(); }
+        }
+        const gain = document.querySelector('input[name="gain"]');
+        if (gain) { gain.value = last.gain; }
+        // The shutter is a list of fractions, so the closest one to what was
+        // actually used is picked - by ratio, which is the scale exposures live on.
+        const sel = document.querySelector('select[name="shutter"]');
+        if (sel && last.exposure_us) {
+            let best = null, bestDiff = Infinity;
+            for (const opt of sel.options) {
+                const diff = Math.abs(Math.log(parseFloat(opt.value) / last.exposure_us));
+                if (diff < bestDiff) { bestDiff = diff; best = opt.value; }
+            }
+            if (best !== null) { sel.value = best; }
+        }
+        const form = document.getElementById("capture_form");
+        if (form) {
+            try { await fetch("/controls", { method: "POST", body: new FormData(form) }); }
+            catch (e) {}
+        }
+        const shown = document.querySelector('select[name="shutter"]');
+        if (out && shown) {
+            out.textContent = "held " + formatShutter(parseFloat(shown.value))
+                + " · gain " + (gain ? gain.value : "?");
+        }
+    });
+
+    refresh();
+    setInterval(refresh, 5000);
+}
+
 function initTimelapse() {
     const start = document.getElementById("tl_start");
     const stop = document.getElementById("tl_stop");
@@ -960,6 +1068,7 @@ function initTimelapse() {
                 text += " · NAS " + (s.nas_ready ? "ready" : (s.nas_reason || "unavailable"));
                 if (s.nas_pending) { text += ", queued " + s.nas_pending; }
             }
+            setRunMode(!!s.active, s);
             info.textContent = text;
         } catch (e) {}
     }
@@ -1071,6 +1180,7 @@ window.addEventListener("DOMContentLoaded", initFocusToggle);
 window.addEventListener("DOMContentLoaded", initFocusMeter);
 window.addEventListener("DOMContentLoaded", initTimelapse);
 window.addEventListener("DOMContentLoaded", initWatch);
+window.addEventListener("DOMContentLoaded", initShotNumbers);
 </script>
 </head>
 <body>
@@ -1203,6 +1313,12 @@ window.addEventListener("DOMContentLoaded", initWatch);
 <input type="range" name="gain" min="1" max="16" step="0.1"
        value="{{ s.gain }}" oninput="updateValue(this)">
 </div>
+<div class="row">
+<label class="title">Last frame used</label>
+<button type="button" class="power-btn" id="hold_shot">Hold these</button>
+<div class="help" id="last_shot">—</div>
+<div class="help">What the frame that was just taken was actually shot with, whether the camera decided or you did. Holding the numbers switches to manual and uses them for every frame from then on, which is how you get a run that repeats itself without guessing at a value.</div>
+</div>
 </div>
 </details>
 
@@ -1216,6 +1332,7 @@ window.addEventListener("DOMContentLoaded", initWatch);
 <button type="button" class="power-btn danger" id="tl_stop">Stop</button>
 <button type="button" class="power-btn" id="nas_sync">Sync now</button>
 </div>
+<div class="notice ok" id="run_banner" style="display:none;"></div>
 <div class="help" id="tl_status">idle</div>
 <details>
 <summary>Timelapse settings</summary>
@@ -1536,6 +1653,7 @@ def capture():
             )
         if ok and TMP_IMAGE_PATH.exists():
             os.replace(TMP_IMAGE_PATH, IMAGE_PATH)
+            _note_last_shot()
             info = f"picamera2 · preset {SETTINGS['resolution']}"
             if raw_target is not None:
                 info += " · +RAW (latest.dng)"
@@ -1660,6 +1778,7 @@ def timelapse_status():
     # Whether the camera is pinned right now, not whether the last run was: the
     # values outlive the run so the record can keep them.
     state["locked"] = bool(timelapse_lock())
+    state["last_shot"] = dict(LAST_SHOT)
     state["dir"] = str(TIMELAPSE_DIR)
     nas_ready, nas_reason = nas_check()
     state["nas_enabled"] = bool(SETTINGS.get("nas_enabled"))
@@ -1733,6 +1852,9 @@ def timelapse_write_meta(session=None):
         "locked_exposure_us": lock.get("exposure_us"),
         "locked_gain": lock.get("gain"),
         "locked_colour_gains": lock.get("colour_gains"),
+        "locked_chosen_by": lock.get("chosen_by"),
+        "locked_lamp_brightness": lock.get("lamp_brightness"),
+        "locked_gain_limited": bool(lock.get("gain_limited")),
     }
     try:
         tmp = folder / (SESSION_META + ".tmp")
@@ -1754,12 +1876,17 @@ def _measure_run_lock():
     tinted blue while the same scene shot under a lamp turned on was neutral.
 
     The measurement is therefore taken in the light the frames will be shot in -
-    lamp on, at the same brightness - and only then is the camera pinned to
+    lamp on, at the same brightness - and only then is the camera fixed to
     whatever it found. Returns {} when it cannot be measured, in which case the
     run carries on with the camera deciding per frame.
+
+    A value the user set by hand is used as it stands: a run has no business
+    overruling a number somebody typed. The white balance is still measured for
+    it, because that is what keeps the frames from drifting in colour.
     """
     if not cam.AVAILABLE:
         return {}
+    manual = bool(SETTINGS.get("manual_exposure"))
     try:
         with capture_lock:
             # Deliberately without a lock: this is the one moment the AE and AWB
@@ -1770,12 +1897,26 @@ def _measure_run_lock():
                 lead = _light_lead_s()
                 if lead > 0:
                     time.sleep(lead)
-                lock = camera.measure_lock()
+                lock = camera.measure_lock(
+                    prefer_gain=None if manual else RUN_GAIN)
     except Exception as exc:
         app.logger.warning("timelapse: exposure measurement failed: %s", exc)
         return {}
     if not lock:
         app.logger.warning("timelapse: no exposure measured, frames stay on auto")
+        return {}
+    if manual:
+        lock["exposure_us"] = int(_number(SETTINGS.get("shutter"), 10000.0,
+                                           100.0, 200_000_000.0))
+        lock["gain"] = round(_number(SETTINGS.get("gain"), 1.0, 1.0, 16.0), 3)
+        lock["chosen_by"] = "hand"
+    else:
+        lock["chosen_by"] = "measured"
+    # The light is part of what was fixed: the same numbers under a different lamp
+    # brightness are a different picture, so the record has to carry both.
+    lock["lamp_on"] = bool(SETTINGS.get("light_flash") and GPIO_AVAILABLE)
+    lock["lamp_brightness"] = round(_lamp_number(
+        SETTINGS.get("light_flash_brightness"), 1.0, 0.0, 1.0), 3)
     return lock
 
 
@@ -2260,6 +2401,7 @@ def timelapse_shot():
                 pass
     if ok:
         _nas_note_frame()            # it is on the card, not yet on the NAS
+        _note_last_shot()            # the page shows what each frame used
     _nas_forget(session)             # this session has new work again
 
     now = time.time()
@@ -2442,6 +2584,12 @@ def image():
 # lease to work at all.
 LEASE_EXEMPT = "/ /alive /image /image.jpg /timelapse/state /focus/score".split()
 
+# While a run is going there is exactly one thing the page may do: stop it.
+# Everything else would change what the frames are - or what they are shot with -
+# in the middle of a series that is supposed to be one consistent thing.
+RUN_LOCKED = {"/controls", "/capture", "/light", "/record/start",
+              "/record/stop", "/nas/sync", "/focus/check", "/timelapse/start"}
+
 
 @app.after_request
 def _remember_page(response):
@@ -2455,15 +2603,17 @@ def _remember_page(response):
 
 @app.before_request
 def _one_browser_at_a_time():
-    """Refuse camera work from a page that does not hold the lease.
+    """Keep camera work to one browser, and to none of it while a run is going.
 
-    A lose-lease page is told so by its heartbeat and stops asking, so the
+    A page without the lease is told so by its heartbeat and stops asking, so the
     streams answer with an empty body rather than an error - the browser would
-    show an error page instead of the notice it is already displaying.
+    otherwise show an error page instead of the notice it is already displaying.
     """
     path = request.path
     if path in LEASE_EXEMPT or path.startswith("/static/"):
         return None
+    if path in RUN_LOCKED and timelapse_active():
+        return jsonify(error="a timelapse is running - stop it first"), 409
     if in_charge():
         return None
     if path in ("/stream", "/focus"):

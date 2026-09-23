@@ -161,8 +161,14 @@ try:
     session = state["session"]
     (local / session).mkdir(parents=True, exist_ok=True)
 
+    kept = app._tl_state["lock"]
     check("the run keeps what was measured",
-          app._tl_state["lock"] == LOCK, app._tl_state.get("lock"))
+          {k: kept.get(k) for k in LOCK} == LOCK, kept)
+    check("the run records the light it was measured in",
+          kept.get("lamp_brightness") == 1.0 and kept.get("lamp_on") is True,
+          kept)
+    check("and says the values were measured, not typed",
+          kept.get("chosen_by") == "measured", kept)
     check("the status says the run is locked", state["locked"] is True, state["locked"])
     check("the measurement happens before the run is marked active",
           fake.calls.index("measure") < len(fake.calls), fake.calls)
@@ -172,7 +178,8 @@ try:
           len(lit) > 1 and lit[-1] is None, lit)
 
     locked = app.effective_controls().get("locked")
-    check("every frame is shot with the measured values", locked == LOCK, locked)
+    check("every frame is shot with the measured values",
+          {k: (locked or {}).get(k) for k in LOCK} == LOCK, locked)
 
     app.timelapse_write_meta(session)
     meta = json.loads((local / session / "session.json").read_text())
@@ -188,7 +195,8 @@ try:
           "locked" not in app.effective_controls(),
           app.effective_controls().get("locked"))
     check("the values stay in the state for the record",
-          app._tl_state["lock"] == LOCK, app._tl_state.get("lock"))
+          app._tl_state["lock"].get("exposure_us") == LOCK["exposure_us"],
+          app._tl_state.get("lock"))
     check("the status stops claiming a lock", stopped["locked"] is False,
           stopped["locked"])
     check("the camera gets the scene back after the run",
@@ -218,6 +226,22 @@ try:
     check("an empty measurement is not treated as a lock",
           state["locked"] is False, state["locked"])
     app.timelapse_stop()
+
+    # A number the user typed is not the run's to change.
+    app.SETTINGS.update(manual_exposure=True, shutter=25000, gain=4.0)
+    fake.answer = dict(LOCK)
+    state = app.timelapse_start(60, 0)
+    (local / state["session"]).mkdir(parents=True, exist_ok=True)
+    kept = app._tl_state["lock"]
+    check("a hand-set shutter is used as it stands",
+          kept.get("exposure_us") == 25000, kept)
+    check("a hand-set gain is used as it stands", kept.get("gain") == 4.0, kept)
+    check("and the record says the values were the user's",
+          kept.get("chosen_by") == "hand", kept)
+    check("the white balance is measured all the same",
+          kept.get("colour_gains") == LOCK["colour_gains"], kept)
+    app.timelapse_stop()
+    app.SETTINGS.update(manual_exposure=False, shutter=10000, gain=1.0)
 finally:
     app.camera = real_cam
     app.cam.AVAILABLE = real_available

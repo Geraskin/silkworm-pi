@@ -465,8 +465,8 @@ class Camera:
         if left > 0:
             time.sleep(left)
 
-    def measure_lock(self, samples=12, gap=0.4, tolerance=0.02):
-        """Let the AE and AWB settle over real frames, then report what they chose.
+    def measure_lock(self, samples=12, gap=0.4, tolerance=0.02, prefer_gain=None):
+        """Let the AE and AWB settle, then report what they chose.
 
         Reading the metadata alone is not enough: it describes the last frame that
         was taken, and between the frames of a run none are, so a loop over it
@@ -480,13 +480,18 @@ class Camera:
         under a lamp left on was neutral. A scene that is already lit settles in
         three or four frames; a dark one takes all of them.
 
+        `prefer_gain` then trades gain for shutter time: the two are
+        interchangeable for exposure, the same picture is on offer at a lower
+        gain with a longer shutter, and only the shutter is free of the noise the
+        gain multiplies. A run asks for the lowest gain the light allows.
+
         Returns {} when it cannot be measured, so a caller can fall back to
         letting the camera decide per frame.
         """
         def near(a, b):
             return abs(a - b) <= tolerance * max(abs(a), abs(b), 1e-6)
 
-        lock, previous, taken = {}, None, 0
+        lock, previous, taken, brightness = {}, None, 0, 0.0
         for _ in range(max(1, int(samples))):
             self._note_start("exposure measurement")
             try:
@@ -495,8 +500,12 @@ class Camera:
                     request = self._picam.capture_request()
                     try:
                         md = request.get_metadata()
+                        # Every sixteenth pixel: enough to know how bright the
+                        # frame is, and cheap on a Pi.
+                        frame = request.make_array("main")[::16, ::16]
                     finally:
                         request.release()
+                brightness = float(frame.mean())
             except Exception as exc:
                 self.last_error = f"measurement failed: {type(exc).__name__}: {exc}"
                 return {}
@@ -519,9 +528,84 @@ class Camera:
             time.sleep(max(0.0, float(gap)))
         if lock.get("exposure_us", 0) <= 0:
             return {}
+        if prefer_gain is not None and lock["gain"] > prefer_gain + 1e-6:
+            lock = self._trade_gain_for_shutter(lock, brightness, prefer_gain)
         lock["samples"] = taken          # the record can say how settled it was
         self.last_error = ""
         return lock
+
+    def _trade_gain_for_shutter(self, lock, brightness, gain):
+        """Re-shoot what the AE found at a lower gain and a longer shutter.
+
+        Exposure is the product of the two, so the same picture is on offer at
+        `gain` for `exposure * gain / gain` of shutter time. What that costs is
+        time and motion blur; what it buys is the noise the gain multiplies.
+
+        The frame duration limit caps how far the shutter can go. When it bites,
+        the rest has to come back from the gain - a slightly noisy frame beats a
+        black one - and the lock says so, so a session can record that its frames
+        were limited by the light rather than chosen.
+        """
+        if brightness <= 1.0:
+            return lock
+        wanted = lock["exposure_us"] * max(lock["gain"], 1e-6) / max(gain, 1e-6)
+        got, md = brightness, None
+        for _ in range(3):
+            self._note_start("exposure measurement")
+            try:
+                with self._lock:
+                    self._wait_for_encoder()
+                    self._picam.set_controls({
+                        "AeEnable": False,
+                        "AnalogueGain": float(gain),
+                        "ExposureTime": int(round(wanted)),
+                    })
+                    request = self._picam.capture_request()
+                    try:
+                        md = request.get_metadata()
+                        got = float(request.make_array("main")[::16, ::16].mean())
+                    finally:
+                        request.release()
+            except Exception as exc:
+                self.last_error = f"gain trade failed: {type(exc).__name__}: {exc}"
+                return lock
+            finally:
+                self._note_end()
+            reached = int(md.get("ExposureTime", 0) or 0)
+            if reached:
+                wanted = reached                  # the camera may have clamped it
+            if abs(got - brightness) <= 0.05 * brightness:
+                break
+            wanted = max(100.0, wanted * brightness / max(got, 1.0))
+        lock = dict(lock)
+        lock["exposure_us"] = int(round(wanted))
+        lock["gain"] = round(float(md.get("AnalogueGain", gain) or gain), 3)
+        gains = md.get("ColourGains") or lock["colour_gains"]
+        lock["colour_gains"] = [round(float(gains[0]), 3), round(float(gains[1]), 3)]
+        # The shutter could not grow far enough, so the gain had to come back.
+        if brightness > 1.0 and 0 < got < 0.9 * brightness:
+            lock["gain"] = round(min(16.0, gain * brightness / got), 3)
+            lock["gain_limited"] = True
+        return lock
+
+    def last_exposure(self):
+        """What the last frame was shot with, or {} if that cannot be read.
+
+        The point is that a choice made on the user's behalf should not be
+        invisible: the page can show the numbers the camera settled on, and offer
+        to hold them, instead of leaving the user to guess what auto did.
+        """
+        try:
+            with self._lock:
+                md = self._picam.capture_metadata()
+            gains = md.get("ColourGains") or (1.0, 1.0)
+            return {
+                "exposure_us": int(md.get("ExposureTime", 0) or 0),
+                "gain": round(float(md.get("AnalogueGain", 1.0) or 1.0), 3),
+                "colour_gains": [round(float(gains[0]), 3), round(float(gains[1]), 3)],
+            }
+        except Exception:
+            return {}
 
     def frames(self, keep_alive=None):
         """Yield multipart MJPEG chunks for an HTTP response.

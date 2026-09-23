@@ -125,6 +125,10 @@ try:
                         data={"interval_s": "30", "max_s": "172800"}).get_json()
     check("the start route passes the length through", reply["max_s"] == 172800,
           reply["max_s"])
+    again = client.post("/timelapse/start", data={"interval_s": "30"})
+    check("a second run cannot be started over a live one",
+          again.status_code == 409, again.status_code)
+    client.post("/timelapse/stop")
     reply = client.post("/timelapse/start", data={"interval_s": "30",
                                                   "max_s": "-5"}).get_json()
     check("a negative length means no limit", reply["max_s"] == 0.0, reply["max_s"])
