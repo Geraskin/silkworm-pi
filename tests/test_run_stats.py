@@ -6,6 +6,8 @@ guards is the figure a person watching that run reads twice - and the "frames
 412" a page can show about a folder that is no longer there.
 """
 import json
+import os
+import re
 import shutil
 import sys
 import tempfile
@@ -26,6 +28,11 @@ for d in (local, base):
 app.TIMELAPSE_DIR = local
 app.TL_STATE_PATH = local / "state.json"
 app.BASE_DIR = base
+# The import above read the real state.json, before the paths were redirected to
+# the empty folder - so read it again from there. Otherwise a run left behind on
+# the machine this is run on leaks into the numbers below: `last_shot_seconds`
+# alone would shift the plan by a frame.
+app.timelapse_load()
 app.SETTINGS.update(resolution="3280x2464", rotation=0, manual_exposure=False,
                     light_flash=False, light_on=False, nas_enabled=False,
                     quality=93, denoise="fast", awb="auto", metering="centre",
@@ -36,6 +43,20 @@ results = []
 
 def check(name, cond, extra=""):
     results.append((name, bool(cond), extra))
+
+
+# Every key session.json carries. Compared as a set and not as a subset: a key
+# that quietly stopped being written is the kind of thing only a folder opened
+# months later would notice - and most of them would not even raise on the way.
+EXPECTED_META = {
+    "session", "started_at", "ended_at", "frames", "interval_s", "resolution",
+    "save_raw", "quality", "rotation", "hflip", "vflip", "exposure_mode",
+    "shutter_us", "gain", "denoise", "awb", "metering", "sharpness",
+    "light_on", "light_brightness", "light_flash", "light_flash_brightness",
+    "light_flash_lead_s", "max_s", "stop_reason", "locked_exposure_us",
+    "locked_gain", "locked_colour_gains", "locked_chosen_by",
+    "locked_lamp_brightness", "locked_gain_limited",
+}
 
 
 def plan(**fields):
@@ -70,7 +91,7 @@ try:
           plan(max_s=3600, frames=12)["left"])
     check("a plan that is used up leaves nothing",
           plan(max_s=3600, frames=60)["left"] == 0)
-    check("more frames than planned does not go negative",
+    check("the plan never sits below what is already taken",
           plan(max_s=3600, frames=99)["left"] == 0,
           plan(max_s=3600, frames=99)["left"])
     check("the bar is the share of the plan done",
@@ -121,6 +142,10 @@ try:
     check("...but its plan is still there to read",
           stopped["planned"] == 60 and stopped["left"] == 48, stopped)
 
+    check("...and it is not computed from a start time nobody has",
+          plan(max_s=3600, started_at_epoch=0)["left_s"] is None,
+          plan(max_s=3600, started_at_epoch=0)["left_s"])
+
     # ------------------------------------------------- nonsense in the state file
     check("an interval of zero is read as one second",
           plan(interval_s=0)["interval_s"] == 1.0, plan(interval_s=0)["interval_s"])
@@ -143,9 +168,23 @@ try:
     (folder / "frame_000004.jpg").write_bytes(b"x" * 1000)
     check("a new frame is a recount, not a guess",
           app._session_bytes(session, 4) == 4000, app._session_bytes(session, 4))
-    app._SESSION_BYTES[session] = (4, 999)
+    app._SESSION_BYTES[session] = (4, 999, 1)
     check("a stale entry is replaced once the count moves on",
-          app._session_bytes(session, 5) == 4000, app._session_bytes(session, 5))
+          app._session_bytes(session, 4) == 4000, app._session_bytes(session, 4))
+    # A frame taken away and another added between two polls: the count is where
+    # it was, so only the folder's own timestamp says the total has moved. The
+    # timestamp is set forward by hand rather than hoped for, because a coarse
+    # filesystem can put both writes inside the same second.
+    (folder / "frame_000004.jpg").unlink()
+    (folder / "frame_000005.jpg").write_bytes(b"y" * 2000)
+    stamp = folder.stat().st_mtime_ns + 5_000_000_000
+    os.utime(folder, ns=(stamp, stamp))
+    check("a swap that leaves the count alone is still a recount",
+          app._session_bytes(session, 4) == 5000, app._session_bytes(session, 4))
+    # Put the folder back the way the payload below expects to find it: four
+    # frames of a thousand bytes each.
+    (folder / "frame_000005.jpg").unlink()
+    (folder / "frame_000004.jpg").write_bytes(b"x" * 1000)
     check("a session that is not there has no size",
           app._session_bytes("tl-20260101-000000", 0) == 0)
     check("a name that is not one of ours has no size",
@@ -195,14 +234,7 @@ try:
     check("the record of the run is still written next to the frames",
           written["session"] == session and written["frames"] == 4, written)
     check("...with everything a folder opened later has to explain itself with",
-          all(key in written for key in (
-              "started_at", "ended_at", "interval_s", "resolution", "save_raw",
-              "quality", "rotation", "shutter_us", "gain", "denoise", "awb",
-              "metering", "sharpness", "light_flash", "light_flash_brightness",
-              "light_flash_lead_s", "max_s", "stop_reason", "locked_exposure_us",
-              "locked_gain", "locked_colour_gains", "locked_chosen_by",
-              "locked_gain_limited")),
-          sorted(written))
+          set(written) == EXPECTED_META, sorted(set(written) ^ EXPECTED_META))
     check("...and it agrees with what the page is showing",
           written["locked_exposure_us"] == status["shot_with"]["locked_exposure_us"]
           and written["resolution"] == status["shot_with"]["resolution"])
@@ -224,6 +256,50 @@ try:
     check("a run with no limit reports no total and no estimate",
           idle["plan"]["planned"] is None and idle["estimated_bytes"] is None,
           idle["plan"])
+
+    # -------------------------------------------------- a new run starts clean
+    app.timelapse_start(600, 0)
+    check("a new run does not inherit the last one's frame cost",
+          app._tl_state.get("last_shot_seconds") == 0.0,
+          app._tl_state.get("last_shot_seconds"))
+    app.timelapse_stop()
+
+    # ------------------------------------------------ and a failure is priced
+    # A shot that fails costs the schedule the same time a successful one does,
+    # so its cost is recorded as well - otherwise a run whose frames keep failing
+    # goes on promising the pace of the last frame that worked.
+    parked = "tl-20260923-130000"
+    (local / parked).mkdir()
+    with app._tl_lock:
+        app._tl_state.update({"active": True, "session": parked, "frames": 0,
+                              "interval_s": 60.0, "max_s": 0.0,
+                              "started_at_epoch": time.time() - 1,
+                              "next_shot_at": time.time() + 1e9,
+                              "last_shot_at": 0.0, "last_shot_seconds": 9.9,
+                              "save_raw": False})
+    app.timelapse_shot()
+    check("a frame that fails still has its cost recorded",
+          app._tl_state.get("last_shot_seconds") != 9.9,
+          app._tl_state.get("last_shot_seconds"))
+    check("...and it is not counted as a frame", app._tl_state["frames"] == 0,
+          app._tl_state["frames"])
+    check("...and the run says why it did not work",
+          bool(app._tl_state.get("last_error")), app._tl_state.get("last_error"))
+    with app._tl_lock:
+        app._tl_state["active"] = False
+
+    # ---------------------------------------------------- the page it lives on
+    # The panel is the one thing here a payload cannot describe, so at least
+    # every element the script reaches for has to exist on the page.
+    used = set(re.findall(r'getElementById\("([^"]+)"\)', app.HTML))
+    defined = set(re.findall(r'id="([^"]+)"', app.HTML))
+    check("every element the script reaches for is on the page",
+          used <= defined, sorted(used - defined)[:8])
+    check("the panel's own parts are among them",
+          {"run_panel", "run_grid", "run_bar_fill", "run_last_img",
+           "run_last_link", "run_last_meta", "run_earlier"} <= defined,
+          sorted({"run_panel", "run_grid", "run_bar_fill", "run_last_img",
+                  "run_last_link", "run_last_meta", "run_earlier"} - defined))
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 

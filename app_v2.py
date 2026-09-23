@@ -1096,7 +1096,7 @@ function initTimelapse() {
         if (!s.active) {
             panel.style.display = "none";
             stats.style.display = "none";
-            strip.dataset.count = "";
+            strip.dataset.newest = "";
             return;
         }
         panel.style.display = "";
@@ -1171,10 +1171,14 @@ function initTimelapse() {
         const meta = document.getElementById("run_last_meta");
         if (last && img && link && meta) {
             const src = frameSrc(list.session, last.name);
-            // Fetched only when there is a new frame: the panel is redrawn every
-            // few seconds and the picture must not flicker with it.
-            if (img.dataset.name !== last.name) {
-                img.dataset.name = last.name;
+            // Fetched only when there is a new picture, so it does not flicker
+            // with the poll - and keyed on the session as well as the name,
+            // because frame names restart at frame_000001.jpg with every run: on
+            // the name alone the panel would keep showing the previous run's
+            // frame while the caption below it described this one.
+            const key = list.session + "/" + last.name;
+            if (img.dataset.key !== key) {
+                img.dataset.key = key;
                 img.src = src + "?w=320";
             }
             img.style.display = "";
@@ -1184,11 +1188,16 @@ function initTimelapse() {
                 + " · " + Math.round(last.bytes / 1024) + " kB";
         } else if (meta) {
             meta.textContent = "No frame yet.";
-            if (img) { img.style.display = "none"; }
+            if (img) { img.style.display = "none"; img.dataset.key = ""; }
         }
 
-        if (strip.dataset.count === String(list.count)) { return; }
-        strip.dataset.count = String(list.count);
+        // Gated on the newest frame and not on the count: the server caps the
+        // list at sixty, so the count stops moving once a run passes that while
+        // the run keeps shooting - and the strip would sit frozen on frames
+        // 49-60 for the rest of it.
+        const newest = last ? (list.session + "/" + last.name) : "";
+        if (strip.dataset.newest === newest) { return; }
+        strip.dataset.newest = newest;
         // Everything before the last one, which is already shown above.
         const rest = list.frames.slice(0, -1).slice(-12).reverse();
         strip.innerHTML = "";
@@ -2010,7 +2019,7 @@ def run_plan(state, now=None):
         "duration_s": duration,
         "elapsed_s": int(round(elapsed)),
         "left_s": (max(0, int(round(duration - elapsed)))
-                   if (active and duration is not None) else None),
+                   if (active and duration is not None and started > 0) else None),
         "next_s": (max(0, int(round(_number(state.get("next_shot_at"), 0.0,
                                          0.0, 4e9) - now)))
                    if active else None),
@@ -2085,6 +2094,9 @@ def session_record(state=None):
     the frames, and it is what the page shows while the run is going. Built once
     because a second list for the panel is exactly how the page and the archive
     end up disagreeing about what the camera was set to.
+
+    Callers that already hold `_tl_lock` must pass `state`: the lock is not
+    reentrant, and the default argument is here only for the ones that do not.
     """
     if state is None:
         with _tl_lock:
@@ -2097,11 +2109,13 @@ def session_record(state=None):
         "session": state.get("session", ""),
         "started_at": state.get("started_at", ""),
         "ended_at": state.get("ended_at", ""),
-        "frames": int(state.get("frames", 0) or 0),
-        "interval_s": float(state.get("interval_s", 60) or 60),
+        # Through `_number`: this is built on every status poll now, and a state
+        # file somebody edited by hand should not turn the panel into a 500.
+        "frames": int(_number(state.get("frames"), 0.0, 0.0, 1e9)),
+        "interval_s": _number(state.get("interval_s"), 60.0, 1.0, 366 * 86400),
         "resolution": SETTINGS.get("resolution"),
         "save_raw": bool(state.get("save_raw")),
-        "quality": int(state.get("quality", 93) or 93),
+        "quality": int(_number(state.get("quality"), 93.0, 1.0, 100.0)),
         "rotation": SETTINGS.get("rotation"),
         "hflip": SETTINGS.get("hflip"),
         "vflip": SETTINGS.get("vflip"),
@@ -2117,7 +2131,7 @@ def session_record(state=None):
         "light_flash": bool(SETTINGS.get("light_flash")),
         "light_flash_brightness": SETTINGS.get("light_flash_brightness"),
         "light_flash_lead_s": SETTINGS.get("light_flash_lead_s"),
-        "max_s": float(state.get("max_s", 0) or 0),
+        "max_s": _number(state.get("max_s"), 0.0, 0.0, 366 * 86400),
         "stop_reason": str(state.get("stop_reason", "") or ""),
         "locked_exposure_us": lock.get("exposure_us"),
         "locked_gain": lock.get("gain"),
@@ -2230,6 +2244,10 @@ def timelapse_start(interval_s, max_s=0.0):
             "quality": int(SETTINGS.get("quality", 93)),
             "frames": 0,
             "last_shot_at": 0.0,
+            # What a frame costs belongs to the run that paid it: the previous
+            # run's cost would otherwise set this one's pace until its first
+            # frame lands.
+            "last_shot_seconds": 0.0,
             "next_shot_at": time.time(),
             "min_free_mb": 500,
             "last_error": "",
@@ -2708,10 +2726,11 @@ def timelapse_shot():
         if ok:
             _tl_state["frames"] = index
             _tl_state["last_shot_at"] = now
-            # What a frame cost in time, lamp lead and all. The next one is
-            # scheduled from the end of this, so the pace a run really keeps is
-            # the interval plus this - which is what the panel's plan uses.
-            _tl_state["last_shot_seconds"] = round(now - shot_began, 3)
+        # What the attempt cost in time, lamp lead and all - written whether it
+        # worked or not, because the schedule is advanced by it either way. A run
+        # whose frames keep failing must not go on promising the pace of the last
+        # frame that did work.
+        _tl_state["last_shot_seconds"] = round(now - shot_began, 3)
         _tl_state["next_shot_at"] = now + max(1.0, float(state.get("interval_s", 60) or 60))
         _tl_state["last_error"] = "" if ok else str(err)
     timelapse_save()
@@ -3195,7 +3214,7 @@ def _session_folder(session):
     return TIMELAPSE_DIR / session
 
 
-_SESSION_BYTES = {}      # session -> (frames, bytes): what the folder held then
+_SESSION_BYTES = {}      # session -> (frames, bytes, folder mtime): what it held
 
 
 def _session_bytes(session, frames):
@@ -3203,16 +3222,22 @@ def _session_bytes(session, frames):
 
     Summed from the frames on the card rather than counted as they are written,
     so a folder somebody pruned by hand cannot leave the page reporting a size
-    that is no longer there. Remembered against the frame count, because the
-    total only moves when a frame is added: the page polls this every few
-    seconds and must not walk a folder of ten thousand files each time.
+    that is no longer there. Remembered against the frame count and the folder's
+    own timestamp, because the total only moves when a frame appears: the page
+    polls this every few seconds and must not walk a folder of ten thousand files
+    each time. The count alone would not be enough - a frame removed and another
+    added between two polls leaves the count where it was and the size stale.
     """
     folder = _session_folder(session)
     if folder is None or not folder.is_dir():
         _SESSION_BYTES.pop(session, None)
         return 0
+    try:
+        stamp = folder.stat().st_mtime_ns
+    except OSError:
+        return 0
     cached = _SESSION_BYTES.get(session)
-    if cached is not None and cached[0] == frames:
+    if cached is not None and cached[0] == frames and cached[2] == stamp:
         return cached[1]
     total = 0
     try:
@@ -3227,7 +3252,7 @@ def _session_bytes(session, frames):
         return 0
     if len(_SESSION_BYTES) > 32:     # one entry per session is plenty
         _SESSION_BYTES.clear()
-    _SESSION_BYTES[session] = (frames, total)
+    _SESSION_BYTES[session] = (frames, total, stamp)
     return total
 
 

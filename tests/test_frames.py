@@ -105,6 +105,22 @@ try:
     check("the list carries a size and a time",
           all(f["bytes"] > 0 and f["at"] for f in listed["frames"]), listed["frames"])
 
+    # The list is capped, and the run panel's strip decides whether to redraw by
+    # watching the newest frame in it - so the newest has to be in there however
+    # long the run has been going. Without that the strip would freeze on the
+    # frames it happened to hold when the run passed the cap.
+    for i in range(4, 66):
+        (frames / f"frame_{i:06d}.jpg").write_bytes(b"\xff\xd8\xff\xd9")
+    long_run = client.get("/timelapse/frames").get_json()
+    names = [f["name"] for f in long_run["frames"]]
+    check("a long run's list is capped",
+          long_run["count"] == app.FRAME_LIST_LIMIT, long_run["count"])
+    check("...and ends with the newest frame",
+          names[-1] == "frame_000065.jpg", names[-1])
+    check("...so it is the last sixty that are listed",
+          names[0] == "frame_000006.jpg" and len(names) == 60,
+          (names[0], len(names)))
+
     whole = client.get(f"/timelapse/frame/{SESSION}/frame_000001.jpg")
     check("a frame can be fetched whole",
           whole.status_code == 200 and whole.data[:2] == b"\xff\xd8",
