@@ -831,6 +831,9 @@ class Camera:
             controls["Sharpness"] = float(s.get("sharpness", 1.0))
 
             if lc is not None:
+                # The mode has to be decided together with the gains below: see
+                # the `lock` block, which overrides both. On its own this is the
+                # automatic behaviour the preview and the stills want.
                 controls["AwbEnable"] = True
                 awb = _AWB_ENUM.get(s.get("awb", "auto"), "Auto")
                 controls["AwbMode"] = getattr(
@@ -863,6 +866,20 @@ class Camera:
                 if len(gains) == 2:
                     controls["AwbEnable"] = False
                     controls["ColourGains"] = (float(gains[0]), float(gains[1]))
+                    # Fixing the gains is not enough on this hardware. With the
+                    # mode left on Auto the ISP keeps working the scene out and
+                    # quietly replaces the gains it was given, so a run that
+                    # pinned its white balance still changed hue between frames -
+                    # three visible jumps in one run, each a step in red or blue.
+                    # The mode has to be manual for the pinned gains to hold.
+                    manual = getattr(lc.AwbModeEnum, "Manual", None) if lc else None
+                    if manual is not None:
+                        controls["AwbMode"] = manual
+                    else:
+                        # No manual entry in this libcamera: leaving the choice
+                        # to auto would be a lie, so the control is dropped
+                        # rather than set to a mode that re-decides.
+                        controls.pop("AwbMode", None)
 
             # Hflip/Vflip are not libcamera controls on the Pi: they are applied
             # through the configuration transform (see start/ensure_orientation).
