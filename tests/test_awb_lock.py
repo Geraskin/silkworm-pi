@@ -42,8 +42,9 @@ class FakeExposureEnum:
 class FakeLibcamera:
     """Just the enums apply_controls() reaches for, with the shape libcamera has.
 
-    Manual exists here because the whole fix depends on it: the real
-    libcamera exposes it, and a build that does not is covered separately below.
+    Manual is included because the fix prefers it when it is there; the Pi's own
+    libcamera does **not** expose it, and `with_libcamera=False` below covers
+    that case using the same enum shape this build has.
     """
 
     AwbModeEnum = FakeAwbModeEnum

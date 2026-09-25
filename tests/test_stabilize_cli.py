@@ -161,6 +161,82 @@ try:
     else:
         check("the shaken comparison could be produced", False, r.stderr[-400:])
 
+    # ------------------------------------------------- a number used twice, and
+    #                                                    a number past the end
+    # The encoder reads frame_%06d.jpg, so a duplicate number means one frame
+    # silently replaces the other, while an extra number past the end is simply
+    # a longer run and must NOT be refused - the frames are contiguous either
+    # way and there is nothing wrong with them.
+    extended = make_frames(tmp / "tl-20260101-250000", count=24)
+    (extended / "frame_000025.jpg").write_bytes((extended / "frame_000004.jpg").read_bytes())
+    r = run([extended, "--height", "240"])
+    check("a frame added past the last number is accepted, not called a gap",
+          r.returncode == 0 and (extended / "timelapse-240p-stabilized.mp4").exists(),
+          (r.stdout + r.stderr)[-300:])
+
+    # A gap in the middle is what the contiguity check exists for, and a file
+    # renamed onto an existing number leaves exactly that.
+    doubled2 = make_frames(tmp / "tl-20260101-255000", count=6)
+    (doubled2 / "frame_000003.jpg").rename(doubled2 / "frame_000099.jpg")
+    r = run([doubled2, "--height", "240"])
+    check("a frame renamed out of the sequence is refused as a gap",
+          r.returncode != 0 and "gaps or duplicates" in (r.stdout + r.stderr),
+          (r.stdout + r.stderr)[-300:])
+
+    # ------------------------------------------------- a frame that cannot be
+    #                                                    decoded is reported, not
+    #                                                    quietly replaced
+    # ffmpeg substitutes a copy of the previous frame for one it cannot read and
+    # still exits 0, so the video looks complete and one frame is a duplicate.
+    # The frame count cannot see it; the log can.
+    broken = make_frames(tmp / "tl-20260101-260000", count=24)
+    (broken / "frame_000012.jpg").write_bytes(b"\xff\xd8\xff\xd9")
+    r = run([broken, "--height", "240"])
+    check("a frame that will not decode is reported, not skipped",
+          r.returncode != 0 and "No JPEG data" in (r.stdout + r.stderr),
+          (r.stdout + r.stderr)[-300:])
+    check("and the video it would have produced is not left behind",
+          not (broken / "timelapse-240p-stabilized.mp4").exists(),
+          sorted(p.name for p in broken.iterdir()))
+
+    # ------------------------------------------------- and a failed render does
+    #                                                   not leave a broken file
+    # where a previous good one was
+    check("no partial file is left behind by the failures",
+          not list(extended.glob("*.part*")) and not list(broken.glob("*.part*")),
+          sorted(p.name for p in broken.iterdir()))
+
+    # The stronger form of the same thing: render a good video, then break the
+    # frames and render again. `ffmpeg -y` truncates its destination before it
+    # knows the render will work, so without the temporary name the good video
+    # would be destroyed and replaced by a truncated one.
+    keeper = make_frames(tmp / "tl-20260101-280000", count=24)
+    r = run([keeper, "--height", "240", "--no-stabilize"])
+    good_video = keeper / "timelapse-240p.mp4"
+    before_bytes = good_video.stat().st_size if good_video.exists() else 0
+    check("the first render produced a video to protect", before_bytes > 0,
+          r.stderr[-300:])
+    (keeper / "frame_000010.jpg").write_bytes(b"\xff\xd8\xff\xd9")
+    r = run([keeper, "--height", "240", "--no-stabilize"])
+    after_bytes = good_video.stat().st_size if good_video.exists() else 0
+    check("a failed re-render does not destroy the good video",
+          r.returncode != 0 and after_bytes == before_bytes,
+          f"{before_bytes} -> {after_bytes}, rc={r.returncode}")
+    check("and leaves no scratch files next to it",
+          not list(keeper.glob("*.part*")) and not list(keeper.glob("*.log")),
+          sorted(p.name for p in keeper.iterdir()))
+
+    # ------------------------------------------------- an entry that is not a
+    #                                                   frame is an error rather
+    #                                                   than a bash crash
+    odd = make_frames(tmp / "tl-20260101-270000", count=24)
+    (odd / "frame_backup.jpg").write_bytes((odd / "frame_000001.jpg").read_bytes())
+    r = run([odd, "--height", "240"])
+    check("a stray file in the folder is refused by name",
+          r.returncode != 0 and "unexpected frame name" in (r.stdout + r.stderr)
+          and "value too great for base" not in (r.stdout + r.stderr),
+          (r.stdout + r.stderr)[-300:])
+
     # --------------------------------------------------------- a hole is refused
     # A hole in the middle of the run, so the sequence really is short rather
     # than merely starting later.

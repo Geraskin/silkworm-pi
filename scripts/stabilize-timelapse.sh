@@ -108,19 +108,43 @@ fi
 FIRST_IMAGE="$(find "${SESSION}" -maxdepth 1 -type f -name 'frame_*.jpg' | sort | head -1)"
 [[ -n "${FIRST_IMAGE}" ]] || die "no frame_*.jpg in ${SESSION}"
 
-FIRST_NUMBER="$(basename "${FIRST_IMAGE}" .jpg | sed 's/^frame_//')"
-[[ "${FIRST_NUMBER}" =~ ^[0-9]{6}$ ]] || die "unexpected frame name: $(basename "${FIRST_IMAGE}")"
+# Any stale measurement file is removed before anything can be measured, so an
+# early failure cannot leave a caller thinking the path on disk belongs to this
+# run. Written after the frames are known to exist, so `--help` and a bad folder
+# still leave an unrelated session's folder untouched.
+TRANSFORMS="${SESSION}/.camera-motion.trf"
+if [[ "${STABILIZE}" -eq 1 ]]; then
+    rm -f "${TRANSFORMS}"
+fi
 
-FRAME_COUNT="$(find "${SESSION}" -maxdepth 1 -type f -name 'frame_*.jpg' | wc -l | tr -d ' ')"
-LAST_NUMBER="$(find "${SESSION}" -maxdepth 1 -type f -name 'frame_*.jpg' | sort | tail -1 | xargs -r basename | sed 's/^frame_//;s/\.jpg$//')"
+# Both ends of the range are checked against the shape the camera writes. The
+# last one matters as much as the first: a file that sorts last without being a
+# frame - `frame_backup.jpg`, or a `frame_0004extra.jpg` - would otherwise reach
+# the arithmetic below and fail with a bash message no user can act on.
+first_name="$(basename "${FIRST_IMAGE}" .jpg)"
+last_name="$(find "${SESSION}" -maxdepth 1 -type f -name 'frame_*.jpg' | sort | tail -1 | xargs -r basename | sed 's/\.jpg$//')"
+for candidate in "${first_name}" "${last_name}"; do
+    [[ "${candidate}" =~ ^frame_[0-9]{6}$ ]] || die "unexpected frame name: ${candidate}"
+done
+
+FIRST_NUMBER="${first_name#frame_}"
+LAST_NUMBER="${last_name#frame_}"
+
+# Counted from the list, so a duplicate number is caught here rather than by the
+# encoder silently overwriting one frame with the next.
+mapfile -t FRAME_NAMES < <(find "${SESSION}" -maxdepth 1 -type f -name 'frame_*.jpg' -printf '%f\n' | sort)
+FRAME_COUNT="${#FRAME_NAMES[@]}"
 EXPECTED=$(( 10#${LAST_NUMBER} - 10#${FIRST_NUMBER} + 1 ))
 [[ "${FRAME_COUNT}" -eq "${EXPECTED}" ]] || \
-    die "the frames have gaps: ${FRAME_COUNT} files span frame ${FIRST_NUMBER} to ${LAST_NUMBER}"
+    die "the frames have gaps or duplicates: ${FRAME_COUNT} files span frame ${FIRST_NUMBER} to ${LAST_NUMBER}"
+
+unique="$(printf '%s\n' "${FRAME_NAMES[@]}" | sort -u | wc -l | tr -d ' ')"
+[[ "${unique}" -eq "${FRAME_COUNT}" ]] || \
+    die "the same frame number appears more than once; the encoder would drop one"
 
 SUFFIX=""
 [[ "${STABILIZE}" -eq 1 ]] && SUFFIX="-stabilized"
 OUTPUT="${SESSION}/timelapse-${HEIGHT}p${SUFFIX}.mp4"
-TRANSFORMS="${SESSION}/.camera-motion.trf"
 
 INPUT_ARGS=(-framerate "${FPS}" -start_number "$(( 10#${FIRST_NUMBER} ))"
             -i "${SESSION}/frame_%06d.jpg")
@@ -129,11 +153,41 @@ INPUT_ARGS=(-framerate "${FPS}" -start_number "$(( 10#${FIRST_NUMBER} ))"
 # shows nothing in others, which looks exactly like a broken download.
 FORMAT_FILTER="scale=-2:${HEIGHT}:flags=lanczos,format=yuv420p"
 
+# The render goes to a temporary name and is renamed only once it is known to be
+# complete. `ffmpeg -y` truncates the destination before it knows the render will
+# succeed, so writing straight to ${OUTPUT} would destroy a good earlier render
+# and leave a truncated file behind when the next one fails - the same reason a
+# captured frame on the Pi is written to a temporary name first.
+render() {
+    local filter="$1"
+    # The temporary name has to end in the real extension: ffmpeg picks the muxer
+    # from the suffix, and `.mp4.part` is not a container it recognises.
+    local part="${OUTPUT%.mp4}.part.mp4" log="${OUTPUT%.mp4}.part.log"
+    rm -f "${part}" "${log}"
+    if ! ffmpeg -hide_banner -loglevel error -y "${INPUT_ARGS[@]}" -vf "${filter}" \
+            -c:v libx264 -preset medium -crf "${CRF}" -movflags +faststart \
+            "${part}" 2>"${log}"; then
+        cat "${log}" >&2
+        rm -f "${part}" "${log}"
+        return 1
+    fi
+    # A frame ffmpeg cannot decode does not make it fail: it substitutes a copy
+    # of the previous one, keeps the frame count, and exits 0 - so counting the
+    # frames in the result cannot see it. The only evidence is what it wrote to
+    # stderr while working, which is why the render is logged separately.
+    if [[ -s "${log}" ]]; then
+        cat "${log}" >&2
+        rm -f "${part}" "${log}"
+        return 1
+    fi
+    rm -f "${log}"
+    mv -f "${part}" "${OUTPUT}"
+}
+
 if [[ "${STABILIZE}" -eq 1 ]]; then
     printf 'Measuring camera movement in %s (%s frames)...\n' "${SESSION}" "${FRAME_COUNT}"
     # mincontrast is lowered because a frame of seedlings has large dark areas
     # the default threshold discards, which would leave the motion unmetered.
-    rm -f "${TRANSFORMS}"
     ffmpeg -hide_banner -loglevel error -y "${INPUT_ARGS[@]}" \
         -vf "vidstabdetect=result=${TRANSFORMS}:shakiness=5:accuracy=15:mincontrast=0.1" \
         -f null - || die "measuring the camera path failed"
@@ -143,16 +197,11 @@ if [[ "${STABILIZE}" -eq 1 ]]; then
     # The transform is applied before the scale, so the correction is measured
     # on the real pixels. zoom adds the margin the shift needs: the frames must
     # still cover the picture after the path has been reversed.
-    ffmpeg -hide_banner -loglevel error -y "${INPUT_ARGS[@]}" \
-        -vf "vidstabtransform=input=${TRANSFORMS}:smoothing=${SMOOTHING}:zoom=${ZOOM}:interpol=bicubic,${FORMAT_FILTER}" \
-        -c:v libx264 -preset medium -crf "${CRF}" -movflags +faststart \
-        "${OUTPUT}" || die "encoding failed"
+    render "vidstabtransform=input=${TRANSFORMS}:smoothing=${SMOOTHING}:zoom=${ZOOM}:interpol=bicubic,${FORMAT_FILTER}" ||
+        die "encoding failed"
 else
     printf 'Rendering %s (%s frames, no stabilization)...\n' "${OUTPUT}" "${FRAME_COUNT}"
-    ffmpeg -hide_banner -loglevel error -y "${INPUT_ARGS[@]}" \
-        -vf "${FORMAT_FILTER}" \
-        -c:v libx264 -preset medium -crf "${CRF}" -movflags +faststart \
-        "${OUTPUT}" || die "encoding failed"
+    render "${FORMAT_FILTER}" || die "encoding failed"
 fi
 
 [[ -s "${OUTPUT}" ]] || die "the encoder wrote nothing to ${OUTPUT}"

@@ -13,6 +13,14 @@ The colour jumps that appeared in the *same* frames are a separate fault and are
 **already fixed** — that was the white-balance mode being left on automatic while
 the gains were pinned. See `tests/test_awb_lock.py`.
 
+**That fix has not yet been confirmed on new frames.** It is certain about the
+old code: `AwbMode` was being sent as `Auto` on a locked run. It is *not* yet
+certain that this was the cause of the jumps, because this Pi's libcamera has no
+`Manual` mode, so the fix takes the branch that stops sending `AwbMode` rather
+than the branch that sends a manual one. Whether the ISP keeps re-deciding once
+the control is no longer sent is exactly what the next run will show. Record a
+short run and compare the frame-to-frame colour before treating it as settled.
+
 ## What the investigation established
 
 The gradient is **uneven illumination**, not a camera fault. The evidence:
@@ -141,9 +149,10 @@ real frames, whose true scene is unknown.
   plan that assumes a manual white-balance mode has to allow for its absence —
   `camera.apply_controls` drops the control rather than leaving a mode that
   re-decides.
-- **The lamp's brightness is software PWM at its best, and group `gpio` can write
-  it.** The flat field has to be shot with the same lamp brightness a run uses,
-  or the correction is measuring a different lighting setup.
+- **The lamp is driven by hardware PWM** through `/sys/class/pwm`, with a
+  gpiozero software-PWM fallback when the channel is missing. The flat field has
+  to be shot with the same lamp brightness a run uses, or the correction is
+  measuring a different lighting setup.
 - **A dark frame at the run's own settings carries no gradient.** At 6748 µs and
   gain 1.0 the dark-current spread works out to 0.04 levels. Any gradient in the
   corrected frames is therefore light, not sensor.
