@@ -18,6 +18,7 @@ The app runs on the Pi itself: Flask on `0.0.0.0:8080`.
 - `camera.py` — picamera2 backend: one camera process serves live preview (MJPEG), stills (JPEG + optional DNG) and video (H.264).
 - `app.py` — old basic version (no lamp, no extended settings). Do not touch unless explicitly needed.
 - `tests/` — host-side checks that need neither camera nor Pi (see below).
+- `scripts/stabilize-timelapse.sh` — host-side tool that assembles one session's `frame_*.jpg` into an MP4 and corrects the drift of the whole picture (see below). The Pi never runs it.
 - `README.md` — what the project is (a Raspberry Pi timelapse camera first) and how to install it.
 - `.devcontainer/` — local dev environment (Python 3.12, Flask, `gpiozero`, plus `openssh-client` + `rsync` for deployment). Machine-specific and **gitignored**: it is not part of the published repository.
 
@@ -43,6 +44,7 @@ These files live only on the Pi and are not committed to the repo.
 - The `gpiozero` import is wrapped in `try/except` — off the Pi the app runs without lamp control (`GPIO_AVAILABLE = False`).
 - Stills are written to a temp file and atomically replaced (`os.replace`).
 - libcamera's `RGB888` is V4L2 `RGB24`, i.e. **BGR in memory** — the still capture swaps the R/B channels before handing the array to PIL, otherwise red and blue come out swapped.
+- **A run's white balance needs the mode fixed, not just the gains.** `apply_controls` sends `AwbEnable = False` and `ColourGains` when a run has a lock, but on this hardware that alone was not enough: the mode stayed `Auto` and the ISP kept working the scene out, quietly replacing the gains it had been given. A run that had pinned its white balance still changed hue between frames - three visible jumps in one run, each a step in red or blue with the mid-frame brightness moving with it. A locked run therefore sets `AwbMode = Manual` as well, and drops the control entirely on a libcamera build that has no manual entry rather than leaving it on a mode that re-decides. Switching the gains off while leaving the mode automatic is the trap; `tests/test_awb_lock.py` exists for it and passes on both cases.
 - The timelapse runs in a background thread that reads `timelapse/state.json` on start-up, so an interrupted run **resumes after a reboot or power cut**; the state is written atomically (`tmp` + `os.replace`) and the next shot time is advanced around every frame. Frames are stored as individual JPEGs — the app does **not** build a video.
 - While a run is going the page becomes that run's panel: frames taken and left, how much room the card has, what the run is shooting with, and the frame it took last at a size that does not take the screen over. The count of frames is worked out from the schedule, not from a counter, so a resumed run reports the same numbers as one that never stopped - and the schedule is the interval **plus what a frame itself costs** (the lamp lead and the capture), because the next frame is counted from the end of the previous one. That is a second out of a minute on a real run, but half the interval on a five-second test, where a plan built on the interval alone promises a frame the run never takes: measured on the Pi, a 20 s run of 5 s frames holds three frames, not four. `session_bytes` is summed from the frames on the card and remembered against the frame count, so polling the page does not walk a folder of thousands of files; `session_on_card` is what stops the status line claiming "412 frames" about a folder that was taken away.
 - Timelapse frames are written locally first and pushed to a NAS afterwards (`nas_flush()`), so a sleeping or unreachable NAS cannot lose a frame. The card is a **cache, not a queue**: local copies are kept, and `nas_prune()` only starts removing them once free space falls below `nas_min_free_percent`, oldest and already-confirmed-on-the-NAS first. A local file is removed only when its NAS copy exists with the same size, so rotation can never delete the only copy; frames not yet uploaded are never touched, which is what makes an unreachable NAS safe. Each file is copied to `<name>.part` and renamed only after the size matches, and a captured frame is itself written to a temporary name and renamed into place, so a sweep can never publish a half-written image. `state.json` never leaves the Pi. **`nas_check()` requires the folder to be a real mount point** (`os.path.ismount`) and not inside the cache: if the share is not mounted the path is just a directory on the card, and the rotation would then delete the "original" because the copy looks safe. Sessions that are already fully archived are tracked in `_nas_mirrored` so a sweep does not re-list thousands of files. On the NAS a session lands in `<nas_dir>/<YYYY-MM-DD>/<session>/`, grouped by day; the date comes from the session name, so a frame always goes to the same place. Each session carries a `session.json` next to the frames describing how and when it was shot (start/stop, interval, resolution, rotation, exposure, denoise, white balance, lamp), rewritten as the run progresses and re-uploaded when its content changes - compared by SHA-256, not by mtime, because timestamp granularity is coarse (tmpfs ticks in ms, an SD card in whole seconds) and a same-length rewrite inside one tick would otherwise look unchanged. **The app never knows the NAS address** — mounting the share is the Pi's job (`/etc/fstab`), the app only gets a mount path from `settings.json`, so no address or credentials can leak into this repository.
@@ -67,6 +69,7 @@ Usage rules:
 | Skill | When to use |
 |-------|-------------|
 | `deploy-pi` | "deploy", "update on the Pi", "upload over SSH", "restart the server on the Raspberry Pi" |
+| `stabilize-timelapse` | "assemble timelapse into video", "the timelapse is wobbly", "the box moved during the run", "stabilize frames", "make a video from the frames" |
 
 ### Installed with the editor — outside the repo
 
@@ -113,6 +116,25 @@ that an interrupted run resumes.
 `python3 tests/test_nas_export.py`, and the same for `test_nas_queue.py` and
 `test_nas_sync.py`. Each is a plain script that prints `PASS`/`FAIL` and exits
 non-zero, so they can be run in a loop.
+
+`test_stabilize_cli.py` is the same shape, and it builds its own frames rather
+than needing a session: the failure it exists to catch is a video made from
+frames with a hole in them, which looks like a short run instead of a broken one.
+The real-session render is behind `STABILIZE_REAL=1`, because encoding hundreds
+of 8 MP frames takes minutes. One lesson is written into that test's fixture and
+is worth remembering: a frame whose detail repeats at a fixed pitch, or whose
+grain is re-randomised every frame, gives the motion detector nothing to follow,
+so a fixture built that way measures the noise and reports real movement as
+none. Static grain beside a few marks works.
+
+`test_awb_lock.py` checks a locked run against a fake `Picamera2` that records the
+controls it is handed, so it needs no camera. It is worth running after any change
+to `apply_controls`: the bug it catches is invisible in the lock dictionary, which
+was correct throughout, and only shows in what actually reaches the camera.
+Host-side tests need `flask` and `pillow` (`pip3 install flask pillow`), which the
+dev container has; `test_nas_sync.py` fails 4 of its 7 checks on this checkout for
+reasons unrelated to the camera - check that separately before assuming a change
+broke it.
 
 Deciding whether a folder is the share or the card needs a real mount, and a
 container cannot mount anything. `/dev/shm` is a tmpfs that already *is* a mount

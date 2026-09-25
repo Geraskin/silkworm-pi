@@ -26,6 +26,24 @@ The point of the project.
          -c:v libx264 -pix_fmt yuv420p timelapse.mp4
   ```
 
+  Or use the tool that ships with the project, which also corrects the drift of
+  the whole picture — useful when the box was knocked mid-run:
+
+  ```bash
+  bash scripts/stabilize-timelapse.sh ./tl-20260923-134701
+  ```
+
+  It runs on the computer that holds the frames, never on the Pi. The frames are
+  not modified, and the movement of the plants themselves is left exactly as
+  shot: only the whole-frame drift is taken out, at the cost of a small crop.
+  See the `stabilize-timelapse` skill for the options.
+
+  It does **not** correct uneven lighting. If one side of the picture is
+  brighter, or has a pink or blue cast, that is the box being lit unevenly and it
+  is in every frame of the run, not something the video or the camera did. See
+  [docs/flat-field-plan.md](docs/flat-field-plan.md) for measuring and removing
+  it.
+
 - **Resumes after a reboot or a power cut.** Progress lives in `state.json`
   (`session`, `interval_s`, `frames`, `last_shot_at`, `next_shot_at`). On start-up
   the app reads it and continues the same session with the same frame numbering.
