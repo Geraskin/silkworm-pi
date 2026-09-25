@@ -12,6 +12,10 @@ camweb.h264
 settings.json
 timelapse/
 
+# Frames copied down for rendering with scripts/stabilize-timelapse.sh. A single
+# session is a few hundred 8 MP JPEGs, which has no business in the repository.
+tmp/
+
 # Machine-specific deploy target (Pi address, key path)
 .github/skills/deploy-pi/deploy.env
 
